@@ -17,6 +17,11 @@ from uuid import uuid4
 import lark_oapi as lark
 import pexpect
 from dotenv import load_dotenv
+from lark_oapi.api.drive.v1 import (
+    GetPermissionPublicRequest,
+    PatchPermissionPublicRequest,
+    PermissionPublicRequest,
+)
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
@@ -34,6 +39,7 @@ from lark_oapi.api.docx.v1 import (
     CreateDocumentBlockChildrenRequestBody,
     CreateDocumentRequest,
     CreateDocumentRequestBody,
+    GetDocumentRequest,
     GetDocumentBlockChildrenRequest,
 )
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
@@ -41,6 +47,8 @@ from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiv
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 MENTION_TOKEN_RE = re.compile(r"@_[^\s]+")
+DOCX_CREATE_CHILDREN_BATCH_SIZE = 50
+DOCX_WRITE_INTERVAL_SECONDS = 0.4
 
 
 @dataclass
@@ -442,6 +450,7 @@ class FeishuCodexBridge:
         self._math_answer_typing_current = ""
         self._math_status_typing_index = 0
         self._math_answer_typing_index = 0
+        self._last_math_doc_error = ""
 
     def _apply_tls_config(self) -> None:
         ssl_context: Optional[ssl.SSLContext] = None
@@ -638,9 +647,9 @@ class FeishuCodexBridge:
             title = raw_title or normalized_text[len("创建数学总结文档"):].strip() or self.config.math_tutor_doc_title
             document_id = self._create_math_summary_document(title)
             if document_id:
-                self._send_text(chat_id, f"数学总结文档已创建：{document_id}")
+                self._send_text(chat_id, f"数学总结文档已创建：{document_id}\n{self._math_summary_doc_link(document_id)}")
             else:
-                self._send_text(chat_id, "创建数学总结文档失败，请检查飞书文档权限。")
+                self._send_text(chat_id, self._last_math_doc_error or "创建数学总结文档失败，请检查飞书文档权限。")
             return
 
         if normalized_text.startswith("绑定数学总结文档 "):
@@ -650,12 +659,15 @@ class FeishuCodexBridge:
                 self._send_text(chat_id, "未识别到文档 ID。可直接发送 document_id，或发送包含 /docx/<id> 的链接。")
                 return
             self.state.set_math_summary_doc(document_id)
-            self._send_text(chat_id, f"已绑定数学总结文档：{document_id}")
+            self._send_text(chat_id, f"已绑定数学总结文档：{document_id}\n{self._math_summary_doc_link(document_id)}")
             return
 
         if normalized_text == "查看数学总结文档":
             if self.state.math_summary_doc_id:
-                self._send_text(chat_id, f"当前数学总结文档：{self.state.math_summary_doc_id}")
+                self._send_text(
+                    chat_id,
+                    f"当前数学总结文档：{self.state.math_summary_doc_id}\n{self._math_summary_doc_link(self.state.math_summary_doc_id)}",
+                )
             else:
                 self._send_text(chat_id, "当前未绑定数学总结文档。可发送“创建数学总结文档”自动创建。")
             return
@@ -1310,12 +1322,19 @@ class FeishuCodexBridge:
         if not status_lines:
             status_lines.append("- 暂无状态")
 
-        answer = self._normalize_math_markdown_for_card("".join(self._math_answer_parts).strip())
-        if not answer:
-            answer = "_等待讲解中..._"
-        if len(answer) > self.config.card_answer_max_chars:
-            answer = "_已折叠更早讲解内容_\n\n" + answer[-self.config.card_answer_max_chars :]
+        answer = self._render_math_doc_link_markdown()
         return "\n".join(status_lines), answer
+
+    def _render_math_doc_link_markdown(self) -> str:
+        document_id = ""
+        if self._math_problem and self._math_problem.doc_document_id:
+            document_id = self._math_problem.doc_document_id
+        elif self.state.math_summary_doc_id:
+            document_id = self.state.math_summary_doc_id
+        if not document_id:
+            return "_讲解同步到云文档后，这里会显示跳转链接。_"
+        link = self._math_summary_doc_link(document_id)
+        return f"[查看本题讲解云文档]({link})"
 
     def _send_math_card(self, chat_id: str) -> str:
         status_md, answer_md = self._render_math_sections()
@@ -1650,23 +1669,33 @@ class FeishuCodexBridge:
         return str(file_path)
 
     def _create_math_summary_document(self, title: str) -> str:
+        self._last_math_doc_error = ""
         req_body = CreateDocumentRequestBody.builder().title(title).build()
         if self.config.math_tutor_doc_folder_token:
             req_body.folder_token = self.config.math_tutor_doc_folder_token
         req = CreateDocumentRequest.builder().request_body(req_body).build()
         resp = self.api_client.docx.v1.document.create(req)
         if not resp.success() or not resp.data or not resp.data.document:
+            self._last_math_doc_error = "创建数学总结文档失败：飞书接口返回错误，请检查机器人文档权限。"
             self._log(f"[bridge] create math doc failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
             return ""
         document_id = resp.data.document.document_id or ""
         if document_id:
+            self._ensure_math_summary_doc_access(document_id)
             self.state.set_math_summary_doc(document_id, title)
         return document_id
 
     def _ensure_math_summary_document(self, problem: Optional[MathTutorProblem] = None) -> str:
         document_id = self.state.math_summary_doc_id
-        if document_id:
+        if document_id and self._math_summary_document_exists(document_id):
             return document_id
+        if document_id:
+            self._log(f"[bridge] stale math summary doc cleared document_id={document_id}")
+            self.state.clear_math_summary_doc()
+            if problem:
+                problem.doc_document_id = ""
+                problem.doc_start_index = -1
+                problem.doc_block_count = 0
         title = self.state.math_summary_doc_title or self.config.math_tutor_doc_title
         document_id = self._create_math_summary_document(title)
         if document_id and problem:
@@ -1678,7 +1707,17 @@ class FeishuCodexBridge:
             return
         if not problem.user_inputs and not problem.answer_parts:
             return
-        document_id = problem.doc_document_id or self._ensure_math_summary_document(problem)
+        document_id = problem.doc_document_id or self.state.math_summary_doc_id
+        if document_id and not self._math_summary_document_exists(document_id):
+            self._log(f"[bridge] math summary doc missing before sync document_id={document_id}")
+            if document_id == self.state.math_summary_doc_id:
+                self.state.clear_math_summary_doc()
+            problem.doc_document_id = ""
+            problem.doc_start_index = -1
+            problem.doc_block_count = 0
+            document_id = ""
+        if not document_id:
+            document_id = self._ensure_math_summary_document(problem)
         if not document_id:
             return
         markdown = self._build_math_summary_markdown(problem)
@@ -1688,8 +1727,9 @@ class FeishuCodexBridge:
             self._flush_math_typewriter()
             self._update_math_card(force=True)
             return
+        pending_start_index = problem.doc_start_index
         if problem.doc_start_index >= 0 and problem.doc_block_count > 0:
-            ok, block_count = self._replace_math_problem_doc_blocks(
+            ok, block_count, error_code, error_msg = self._replace_math_problem_doc_blocks(
                 document_id=document_id,
                 start_index=problem.doc_start_index,
                 old_count=problem.doc_block_count,
@@ -1698,44 +1738,90 @@ class FeishuCodexBridge:
             action = "更新"
         else:
             start_index = self._document_child_count(document_id)
-            ok, block_count = self._append_blocks_to_document(document_id, start_index, blocks)
-            if ok:
-                problem.doc_start_index = start_index
+            pending_start_index = start_index
+            ok, block_count, error_code, error_msg = self._append_blocks_to_document(document_id, start_index, blocks)
             action = "同步"
+        problem.doc_document_id = document_id
+        if pending_start_index >= 0:
+            problem.doc_start_index = pending_start_index
+        if block_count > 0:
+            problem.doc_block_count = block_count
         if not ok:
+            if self._is_resource_deleted_error(error_code, error_msg):
+                self._log(f"[bridge] math summary doc deleted during sync document_id={document_id}")
+                if document_id == self.state.math_summary_doc_id:
+                    self.state.clear_math_summary_doc()
+                problem.doc_document_id = ""
+                problem.doc_start_index = -1
+                problem.doc_block_count = 0
+                recreated_document_id = self._ensure_math_summary_document(problem)
+                if recreated_document_id:
+                    retry_start_index = self._document_child_count(recreated_document_id)
+                    retry_ok, retry_block_count, retry_error_code, retry_error_msg = self._append_blocks_to_document(
+                        recreated_document_id,
+                        retry_start_index,
+                        blocks,
+                    )
+                    if retry_ok:
+                        problem.doc_document_id = recreated_document_id
+                        problem.doc_start_index = retry_start_index
+                        problem.doc_block_count = retry_block_count
+                        problem.doc_synced = True
+                        self._append_math_status(f"原文档已失效，已自动迁移到新文档：{recreated_document_id}")
+                        self._flush_math_typewriter()
+                        self._update_math_card(force=True)
+                        return
             self._append_math_status("同步飞书文档失败：写入文档接口报错。")
             self._flush_math_typewriter()
             self._update_math_card(force=True)
             return
-        problem.doc_document_id = document_id
-        problem.doc_block_count = block_count
         problem.doc_synced = True
         self._append_math_status(f"本题已{action}到飞书文档：{document_id}")
         self._flush_math_typewriter()
         self._update_math_card(force=True)
 
-    def _append_blocks_to_document(self, document_id: str, index: int, blocks: list) -> tuple[bool, int]:
-        req = (
-            CreateDocumentBlockChildrenRequest.builder()
-            .document_id(document_id)
-            .block_id(document_id)
-            .document_revision_id(-1)
-            .request_body(
-                CreateDocumentBlockChildrenRequestBody.builder()
-                .children(blocks)
-                .index(index)
+    def _append_blocks_to_document(self, document_id: str, index: int, blocks: list) -> tuple[bool, int, int, str]:
+        if not blocks:
+            return True, 0, 0, ""
+        total_created = 0
+        next_index = index
+        for offset in range(0, len(blocks), DOCX_CREATE_CHILDREN_BATCH_SIZE):
+            batch = blocks[offset : offset + DOCX_CREATE_CHILDREN_BATCH_SIZE]
+            req = (
+                CreateDocumentBlockChildrenRequest.builder()
+                .document_id(document_id)
+                .block_id(document_id)
+                .document_revision_id(-1)
+                .request_body(
+                    CreateDocumentBlockChildrenRequestBody.builder()
+                    .children(batch)
+                    .index(next_index)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        resp = self.api_client.docx.v1.document_block_children.create(req)
-        if not resp.success():
-            self._log(f"[bridge] append math doc failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
-            return False, 0
-        created = list(resp.data.children or []) if resp.data else []
-        return True, len(created) or len(blocks)
+            resp = self.api_client.docx.v1.document_block_children.create(req)
+            if not resp.success():
+                self._log(
+                    f"[bridge] append math doc failed code={resp.code} msg={resp.msg} "
+                    f"log_id={resp.get_log_id()} batch_start={offset} batch_size={len(batch)}"
+                )
+                return False, total_created, int(resp.code or 0), str(resp.msg or "")
+            created = list(resp.data.children or []) if resp.data else []
+            created_count = len(created) or len(batch)
+            total_created += created_count
+            next_index += created_count
+            if offset + DOCX_CREATE_CHILDREN_BATCH_SIZE < len(blocks):
+                time.sleep(DOCX_WRITE_INTERVAL_SECONDS)
+        return True, total_created, 0, ""
 
-    def _replace_math_problem_doc_blocks(self, document_id: str, start_index: int, old_count: int, blocks: list) -> tuple[bool, int]:
+    def _replace_math_problem_doc_blocks(
+        self,
+        document_id: str,
+        start_index: int,
+        old_count: int,
+        blocks: list,
+    ) -> tuple[bool, int, int, str]:
         if old_count > 0:
             delete_req = (
                 BatchDeleteDocumentBlockChildrenRequest.builder()
@@ -1756,7 +1842,7 @@ class FeishuCodexBridge:
                     f"[bridge] replace math doc delete failed code={delete_resp.code} "
                     f"msg={delete_resp.msg} log_id={delete_resp.get_log_id()}"
                 )
-                return False, old_count
+                return False, old_count, int(delete_resp.code or 0), str(delete_resp.msg or "")
         return self._append_blocks_to_document(document_id, start_index, blocks)
 
     def _convert_markdown_to_blocks(self, markdown: str) -> list:
@@ -1799,6 +1885,55 @@ class FeishuCodexBridge:
             page_token = getattr(resp.data, "page_token", "") or ""
             if not page_token:
                 return count
+
+    def _ensure_math_summary_doc_access(self, document_id: str) -> None:
+        req = GetPermissionPublicRequest.builder().token(document_id).type("docx").build()
+        resp = self.api_client.drive.v1.permission_public.get(req)
+        if not resp.success() or not resp.data or not resp.data.permission_public:
+            self._log(
+                f"[bridge] get math doc public permission failed document_id={document_id} "
+                f"code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+            )
+            return
+        permission = resp.data.permission_public
+        if getattr(permission, "link_share_entity", "") == "tenant_readable":
+            return
+        patch_req = (
+            PatchPermissionPublicRequest.builder()
+            .token(document_id)
+            .type("docx")
+            .request_body(PermissionPublicRequest.builder().link_share_entity("tenant_readable").build())
+            .build()
+        )
+        patch_resp = self.api_client.drive.v1.permission_public.patch(patch_req)
+        if not patch_resp.success():
+            self._log(
+                f"[bridge] patch math doc public permission failed document_id={document_id} "
+                f"code={patch_resp.code} msg={patch_resp.msg} log_id={patch_resp.get_log_id()}"
+            )
+
+    def _math_summary_document_exists(self, document_id: str) -> bool:
+        if not document_id:
+            return False
+        req = GetDocumentRequest.builder().document_id(document_id).build()
+        resp = self.api_client.docx.v1.document.get(req)
+        if resp.success() and resp.data and resp.data.document:
+            return True
+        if self._is_resource_deleted_error(int(resp.code or 0), str(resp.msg or "")):
+            return False
+        self._log(
+            f"[bridge] get math doc failed document_id={document_id} code={resp.code} "
+            f"msg={resp.msg} log_id={resp.get_log_id()}"
+        )
+        return True
+
+    @staticmethod
+    def _is_resource_deleted_error(code: int, msg: str) -> bool:
+        return code == 1770003 or "resource deleted" in (msg or "").lower()
+
+    @staticmethod
+    def _math_summary_doc_link(document_id: str) -> str:
+        return f"https://my.feishu.cn/docx/{document_id}"
 
     def _build_math_summary_markdown(self, problem: MathTutorProblem) -> str:
         question_lines = []
