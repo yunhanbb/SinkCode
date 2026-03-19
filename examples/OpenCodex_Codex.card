@@ -1,0 +1,133 @@
+{
+  "name": "OpenCodex Codex",
+  "dsl": {
+    "schema": "2.0",
+    "config": {
+      "update_multi": true,
+      "streaming_mode": true,
+      "streaming_config": {
+        "print_step": { "default": 2, "pc": 4, "mobile": 2 },
+        "print_frequency_ms": { "default": 80, "pc": 60, "mobile": 100 },
+        "print_strategy": "fast"
+      },
+      "summary": { "content": "OpenCodex Codex 会话正在生成中" }
+    },
+    "header": {
+      "title": { "tag": "plain_text", "content": "OpenCodex · Codex CLI" },
+      "subtitle": { "tag": "plain_text", "content": "Prompt / Activity / Commands / Response" },
+      "text_tag_list": [
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "CODEX" }, "color": "blue" },
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "TASK" }, "color": "wathet" },
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "STREAM" }, "color": "indigo" }
+      ],
+      "template": "blue",
+      "padding": "12px"
+    },
+    "body": {
+      "direction": "vertical",
+      "padding": "12px 12px 12px 12px",
+      "vertical_spacing": "8px",
+      "horizontal_align": "left",
+      "vertical_align": "top",
+      "elements": [
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "grey-50",
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                { "tag": "markdown", "content": "### Activity" },
+                {
+                  "tag": "markdown",
+                  "content": "${status_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "status_content"
+                }
+              ]
+            }
+          ]
+        },
+        { "tag": "hr", "margin": "0px" },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                { "tag": "markdown", "content": "### Response" },
+                {
+                  "tag": "markdown",
+                  "content": "${answer_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "answer_content"
+                }
+              ]
+            }
+          ]
+        },
+        { "tag": "hr", "margin": "0px" },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "blue-50",
+              "padding": "10px 12px 10px 12px",
+              "vertical_spacing": "4px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                {
+                  "tag": "markdown",
+                  "content": "**Codex 会话卡**\n用于每条自然语言请求的一次独立任务。状态区适合展示命令轨迹、完成/中断提示；回答区适合展示 Markdown 结构化结果、代码块、diff 摘要与下一步建议。"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "variables": [
+    {
+      "type": "text",
+      "apiName": "var_codex_answer",
+      "name": "answer_content",
+      "desc": "Codex 回答区内容",
+      "mockData": "### Response\n已完成 OpenCodex 富文本卡片升级。\n\n- 已支持多区块渲染\n- 已支持模板卡与原生 interactive 双路径\n\n```shell\npython -m py_compile app.py\n```"
+    },
+    {
+      "type": "text",
+      "apiName": "var_codex_status",
+      "name": "status_content",
+      "desc": "Codex 状态区内容",
+      "mockData": "1. 新请求已接收\n2. 正在分析项目结构\n3. 正在执行命令：`python -m py_compile app.py`\n4. 正在生成回答"
+    }
+  ]
+}

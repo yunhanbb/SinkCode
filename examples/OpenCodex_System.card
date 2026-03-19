@@ -1,0 +1,133 @@
+{
+  "name": "OpenCodex System",
+  "dsl": {
+    "schema": "2.0",
+    "config": {
+      "update_multi": true,
+      "streaming_mode": true,
+      "streaming_config": {
+        "print_step": { "default": 2, "pc": 4, "mobile": 2 },
+        "print_frequency_ms": { "default": 80, "pc": 60, "mobile": 100 },
+        "print_strategy": "fast"
+      },
+      "summary": { "content": "OpenCodex 系统消息面板" }
+    },
+    "header": {
+      "title": { "tag": "plain_text", "content": "OpenCodex · System Panel" },
+      "subtitle": { "tag": "plain_text", "content": "Terminal / Bind / Runtime Status / Feed" },
+      "text_tag_list": [
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "SYSTEM" }, "color": "grey" },
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "PANEL" }, "color": "neutral" },
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "STREAM" }, "color": "wathet" }
+      ],
+      "template": "grey",
+      "padding": "12px"
+    },
+    "body": {
+      "direction": "vertical",
+      "padding": "12px 12px 12px 12px",
+      "vertical_spacing": "8px",
+      "horizontal_align": "left",
+      "vertical_align": "top",
+      "elements": [
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "grey-50",
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                { "tag": "markdown", "content": "### Status" },
+                {
+                  "tag": "markdown",
+                  "content": "${status_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "status_content"
+                }
+              ]
+            }
+          ]
+        },
+        { "tag": "hr", "margin": "0px" },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                { "tag": "markdown", "content": "### Feed" },
+                {
+                  "tag": "markdown",
+                  "content": "${answer_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "answer_content"
+                }
+              ]
+            }
+          ]
+        },
+        { "tag": "hr", "margin": "0px" },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "grey-100",
+              "padding": "10px 12px 10px 12px",
+              "vertical_spacing": "4px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                {
+                  "tag": "markdown",
+                  "content": "**系统消息卡**\n用于普通终端模式、绑定信息提示、帮助文本、运行状态、错误反馈与模式切换提示。适合复用同一张共享卡，减少刷屏。"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "variables": [
+    {
+      "type": "text",
+      "apiName": "var_system_answer",
+      "name": "answer_content",
+      "desc": "系统消息面板正文",
+      "mockData": "### Feed\n桥接服务已启动。\n\n- 当前模式：普通终端模式\n- 已绑定会话：oc_xxx\n- 可发送 `/status` 查看详细状态"
+    },
+    {
+      "type": "text",
+      "apiName": "var_system_status",
+      "name": "status_content",
+      "desc": "系统状态区内容",
+      "mockData": "- bridge 运行中\n- shell: /bin/zsh\n- codex_mode: false\n- math_tutor_mode: false"
+    }
+  ]
+}

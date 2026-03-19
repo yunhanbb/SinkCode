@@ -1,0 +1,133 @@
+{
+  "name": "OpenCodex Math",
+  "dsl": {
+    "schema": "2.0",
+    "config": {
+      "update_multi": true,
+      "streaming_mode": true,
+      "streaming_config": {
+        "print_step": { "default": 2, "pc": 4, "mobile": 2 },
+        "print_frequency_ms": { "default": 80, "pc": 60, "mobile": 100 },
+        "print_strategy": "fast"
+      },
+      "summary": { "content": "OpenCodex 数学辅导讲解中" }
+    },
+    "header": {
+      "title": { "tag": "plain_text", "content": "OpenCodex · 数学辅导" },
+      "subtitle": { "tag": "plain_text", "content": "Problem / Guidance / Doc Sync" },
+      "text_tag_list": [
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "MATH" }, "color": "indigo" },
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "TUTOR" }, "color": "purple" },
+        { "tag": "text_tag", "text": { "tag": "plain_text", "content": "STREAM" }, "color": "blue" }
+      ],
+      "template": "indigo",
+      "padding": "12px"
+    },
+    "body": {
+      "direction": "vertical",
+      "padding": "12px 12px 12px 12px",
+      "vertical_spacing": "8px",
+      "horizontal_align": "left",
+      "vertical_align": "top",
+      "elements": [
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "grey-50",
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                { "tag": "markdown", "content": "### Activity" },
+                {
+                  "tag": "markdown",
+                  "content": "${status_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "status_content"
+                }
+              ]
+            }
+          ]
+        },
+        { "tag": "hr", "margin": "0px" },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                { "tag": "markdown", "content": "### Explanation" },
+                {
+                  "tag": "markdown",
+                  "content": "${answer_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "answer_content"
+                }
+              ]
+            }
+          ]
+        },
+        { "tag": "hr", "margin": "0px" },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "indigo-50",
+              "padding": "10px 12px 10px 12px",
+              "vertical_spacing": "4px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                {
+                  "tag": "markdown",
+                  "content": "**数学辅导卡**\n用于图片题、文字题、多轮追问与文档沉淀。状态区适合展示识图、会话建立、文档同步；讲解区适合展示分步说明、公式与总结。"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "variables": [
+    {
+      "type": "text",
+      "apiName": "var_math_answer",
+      "name": "answer_content",
+      "desc": "数学讲解正文",
+      "mockData": "### Explanation\n已知 $x \\to 0$，先观察分子的最低非零项。\n\n1. 分别展开每一项\n2. 比较主导项阶数\n3. 令分母与分子同阶同系数\n\n结论：可据此求出参数。"
+    },
+    {
+      "type": "text",
+      "apiName": "var_math_status",
+      "name": "status_content",
+      "desc": "数学讲解状态区",
+      "mockData": "1. 收到第 1 题图片\n2. 已建立数学辅导会话\n3. 正在生成分步讲解\n4. 准备同步飞书文档"
+    }
+  ]
+}

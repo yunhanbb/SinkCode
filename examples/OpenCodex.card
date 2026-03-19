@@ -1,0 +1,182 @@
+{
+  "name": "OpenCodex",
+  "dsl": {
+    "schema": "2.0",
+    "config": {
+      "update_multi": true,
+      "streaming_mode": true,
+      "streaming_config": {
+        "print_step": {
+          "default": 2,
+          "pc": 4,
+          "mobile": 2
+        },
+        "print_frequency_ms": {
+          "default": 80,
+          "pc": 60,
+          "mobile": 100
+        },
+        "print_strategy": "fast"
+      },
+      "summary": {
+        "content": "OpenCodex 正在生成中"
+      }
+    },
+    "header": {
+      "title": {
+        "tag": "plain_text",
+        "content": "OpenCodex"
+      },
+      "subtitle": {
+        "tag": "plain_text",
+        "content": "Codex / Terminal / Math Unified Card"
+      },
+      "text_tag_list": [
+        {
+          "tag": "text_tag",
+          "text": {
+            "tag": "plain_text",
+            "content": "LIVE"
+          },
+          "color": "blue"
+        },
+        {
+          "tag": "text_tag",
+          "text": {
+            "tag": "plain_text",
+            "content": "STREAM"
+          },
+          "color": "wathet"
+        },
+        {
+          "tag": "text_tag",
+          "text": {
+            "tag": "plain_text",
+            "content": "OpenCodex"
+          },
+          "color": "indigo"
+        }
+      ],
+      "template": "blue",
+      "padding": "12px"
+    },
+    "body": {
+      "direction": "vertical",
+      "padding": "12px 12px 12px 12px",
+      "vertical_spacing": "8px",
+      "horizontal_align": "left",
+      "vertical_align": "top",
+      "elements": [
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "grey-50",
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                {
+                  "tag": "markdown",
+                  "content": "### Activity"
+                },
+                {
+                  "tag": "markdown",
+                  "content": "${status_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "status_content"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "tag": "hr",
+          "margin": "0px"
+        },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "padding": "12px 12px 12px 12px",
+              "vertical_spacing": "8px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                {
+                  "tag": "markdown",
+                  "content": "### Response"
+                },
+                {
+                  "tag": "markdown",
+                  "content": "${answer_content}",
+                  "text_align": "left",
+                  "text_size": "normal",
+                  "element_id": "answer_content"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "tag": "hr",
+          "margin": "0px"
+        },
+        {
+          "tag": "column_set",
+          "flex_mode": "stretch",
+          "horizontal_align": "left",
+          "margin": "0px",
+          "columns": [
+            {
+              "tag": "column",
+              "width": "weighted",
+              "weight": 1,
+              "background_style": "blue-50",
+              "padding": "10px 12px 10px 12px",
+              "vertical_spacing": "4px",
+              "horizontal_align": "left",
+              "vertical_align": "top",
+              "elements": [
+                {
+                  "tag": "markdown",
+                  "content": "**OpenCodex Message Card**\n适用于 Codex 会话、系统消息、数学辅导三类场景。回答区支持 Markdown、列表、引用、链接与代码块；状态区适合流式展示执行轨迹、完成状态与中断提示。"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "variables": [
+    {
+      "type": "text",
+      "apiName": "var_mmxeth4g",
+      "name": "answer_content",
+      "desc": "OpenCodex 回答内容，支持 Markdown 富文本渲染。",
+      "mockData": "### Response\n已连接到 OpenCodex 富文本卡片。\n\n- 支持 Markdown 标题\n- 支持列表\n- 支持引用\n- 支持代码块\n\n```shell\npython -m py_compile app.py\n```\n\n> 这是一条示例引用，用于验证飞书卡片中的富文本渲染效果。"
+    },
+    {
+      "type": "text",
+      "apiName": "var_mmxethaa",
+      "name": "status_content",
+      "desc": "OpenCodex 状态内容，适合流式渲染执行轨迹。",
+      "mockData": "1. 新请求已接收\n2. 正在分析项目结构\n3. 正在执行命令：`python -m py_compile app.py`\n4. 正在生成回答"
+    }
+  ]
+}
