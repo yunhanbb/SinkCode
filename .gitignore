@@ -6,13 +6,6 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
-env/
-ENV/
-
-# Environment files (keep examples)
-.env
-.env.*
-!.env.example
 
 # Runtime state/logs
 .bridge_state.json

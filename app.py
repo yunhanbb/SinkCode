@@ -5,6 +5,7 @@ import re
 import shlex
 import signal
 import ssl
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -19,8 +20,19 @@ from dotenv import load_dotenv
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    GetImageRequest,
+    GetMessageResourceRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
+)
+from lark_oapi.api.docx.v1 import (
+    ConvertDocumentRequest,
+    ConvertDocumentRequestBody,
+    CreateDocumentBlockChildrenRequest,
+    CreateDocumentBlockChildrenRequestBody,
+    CreateDocumentRequest,
+    CreateDocumentRequestBody,
+    GetDocumentBlockChildrenRequest,
 )
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 
@@ -44,6 +56,8 @@ class Config:
     card_update_interval_seconds: float
     card_status_max_lines: int
     card_answer_max_chars: int
+    typewriter_status_chars_per_tick: int
+    typewriter_answer_chars_per_tick: int
     max_message_chars: int
     allowed_prefixes: tuple[str, ...]
     ca_cert_path: Optional[Path]
@@ -52,6 +66,9 @@ class Config:
     card_template_var_name: str
     card_status_var_name: str
     card_answer_var_name: str
+    math_tutor_system_prompt: str
+    math_tutor_doc_folder_token: str
+    math_tutor_doc_title: str
 
     @staticmethod
     def load() -> "Config":
@@ -90,6 +107,8 @@ class Config:
             card_update_interval_seconds=float(os.getenv("CARD_UPDATE_INTERVAL_SECONDS", "0.8")),
             card_status_max_lines=int(os.getenv("CARD_STATUS_MAX_LINES", "18")),
             card_answer_max_chars=int(os.getenv("CARD_ANSWER_MAX_CHARS", "2600")),
+            typewriter_status_chars_per_tick=int(os.getenv("TYPEWRITER_STATUS_CHARS_PER_TICK", "8")),
+            typewriter_answer_chars_per_tick=int(os.getenv("TYPEWRITER_ANSWER_CHARS_PER_TICK", "24")),
             max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "1200")),
             allowed_prefixes=prefixes,
             ca_cert_path=ca_cert_path,
@@ -98,6 +117,9 @@ class Config:
             card_template_var_name=os.getenv("CARD_TEMPLATE_VAR_NAME", "content").strip() or "content",
             card_status_var_name=os.getenv("CARD_STATUS_VAR_NAME", "status_content").strip(),
             card_answer_var_name=os.getenv("CARD_ANSWER_VAR_NAME", "answer_content").strip(),
+            math_tutor_system_prompt=os.getenv("MATH_TUTOR_SYSTEM_PROMPT", "").strip(),
+            math_tutor_doc_folder_token=os.getenv("MATH_TUTOR_DOC_FOLDER_TOKEN", "").strip(),
+            math_tutor_doc_title=os.getenv("MATH_TUTOR_DOC_TITLE", "OpenCodex 数学辅导总结").strip() or "OpenCodex 数学辅导总结",
         )
 
 
@@ -106,6 +128,9 @@ class BridgeState:
         self.state_file = state_file
         self.authorized_open_id: Optional[str] = None
         self.bound_chat_id: Optional[str] = None
+        self.math_tutor_system_prompt: str = ""
+        self.math_summary_doc_id: str = ""
+        self.math_summary_doc_title: str = ""
         self._lock = threading.Lock()
         self._load()
 
@@ -116,6 +141,9 @@ class BridgeState:
             raw = json.loads(self.state_file.read_text(encoding="utf-8"))
             self.authorized_open_id = raw.get("authorized_open_id")
             self.bound_chat_id = raw.get("bound_chat_id")
+            self.math_tutor_system_prompt = str(raw.get("math_tutor_system_prompt") or "")
+            self.math_summary_doc_id = str(raw.get("math_summary_doc_id") or "")
+            self.math_summary_doc_title = str(raw.get("math_summary_doc_title") or "")
         except Exception:
             pass
 
@@ -123,16 +151,39 @@ class BridgeState:
         with self._lock:
             self.authorized_open_id = open_id
             self.bound_chat_id = chat_id
-            payload = {
-                "authorized_open_id": self.authorized_open_id,
-                "bound_chat_id": self.bound_chat_id,
-            }
-            self.state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._save_locked()
+
+    def set_math_tutor_system_prompt(self, prompt: str) -> None:
+        with self._lock:
+            self.math_tutor_system_prompt = prompt.strip()
+            self._save_locked()
+
+    def set_math_summary_doc(self, document_id: str, title: str = "") -> None:
+        with self._lock:
+            self.math_summary_doc_id = document_id.strip()
+            self.math_summary_doc_title = title.strip()
+            self._save_locked()
+
+    def clear_math_summary_doc(self) -> None:
+        with self._lock:
+            self.math_summary_doc_id = ""
+            self.math_summary_doc_title = ""
+            self._save_locked()
 
     def is_authorized(self, open_id: Optional[str]) -> bool:
         if not self.authorized_open_id:
             return True
         return bool(open_id) and open_id == self.authorized_open_id
+
+    def _save_locked(self) -> None:
+        payload = {
+            "authorized_open_id": self.authorized_open_id,
+            "bound_chat_id": self.bound_chat_id,
+            "math_tutor_system_prompt": self.math_tutor_system_prompt,
+            "math_summary_doc_id": self.math_summary_doc_id,
+            "math_summary_doc_title": self.math_summary_doc_title,
+        }
+        self.state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 @dataclass
@@ -150,6 +201,25 @@ class CodexTask:
     events: list[str]
     card_message_id: str
     last_card_push_ts: float
+
+
+@dataclass
+class MathTutorProblem:
+    problem_id: str
+    problem_index: int
+    chat_id: str
+    sender_open_id: str
+    status: str
+    started_at: str
+    updated_at: str
+    finished_at: str
+    thread_id: str
+    card_message_id: str
+    last_card_push_ts: float
+    user_inputs: list[str]
+    answer_parts: list[str]
+    image_paths: list[str]
+    doc_synced: bool
 
 
 class HistoryStore:
@@ -338,11 +408,35 @@ class FeishuCodexBridge:
 
         self.forwarder_thread = threading.Thread(target=self._forward_terminal_output, daemon=True)
         self.codex_mode = False
+        self.math_tutor_mode = False
         self._mobile_line_carry = ""
         self._active_task: Optional[CodexTask] = None
+        self._math_problem: Optional[MathTutorProblem] = None
+        self._math_problem_counter = 0
+        self._math_runner_thread: Optional[threading.Thread] = None
+        self._math_process: Optional[object] = None
+        self._math_lock = threading.Lock()
+        self._math_asset_dir = self.config.history_dir / "math_assets"
+        self._math_asset_dir.mkdir(parents=True, exist_ok=True)
+        self._general_card_message_id = ""
+        self._general_feed_parts: list[str] = []
         self._session_card_message_id = ""
         self._session_status_parts: list[str] = []
         self._session_answer_parts: list[str] = []
+        self._status_pending: list[str] = []
+        self._answer_pending: list[str] = []
+        self._status_typing_current = ""
+        self._answer_typing_current = ""
+        self._status_typing_index = 0
+        self._answer_typing_index = 0
+        self._math_status_parts: list[str] = []
+        self._math_answer_parts: list[str] = []
+        self._math_status_pending: list[str] = []
+        self._math_answer_pending: list[str] = []
+        self._math_status_typing_current = ""
+        self._math_answer_typing_current = ""
+        self._math_status_typing_index = 0
+        self._math_answer_typing_index = 0
 
     def _apply_tls_config(self) -> None:
         ssl_context: Optional[ssl.SSLContext] = None
@@ -407,6 +501,7 @@ class FeishuCodexBridge:
 
     def stop(self) -> None:
         self.shutdown.set()
+        self._interrupt_math_tutor()
         self.shell.stop()
 
     def _on_receive_message(self, data: P2ImMessageReceiveV1) -> None:
@@ -422,17 +517,21 @@ class FeishuCodexBridge:
             sender_open_id = event.sender.sender_id.open_id
 
         chat_id = event.message.chat_id or ""
-        text = self._extract_text(event.message.message_type, event.message.content)
+        message_id = event.message.message_id or ""
+        message_type = event.message.message_type or ""
+        text = self._extract_text(message_type, event.message.content)
         normalized_text = self._normalize_incoming_text(text)
+        image_key = self._extract_image_key(message_type, event.message.content)
         self._log(
             "[bridge] incoming: "
             f"chat_id={chat_id} "
             f"sender_open_id={sender_open_id} "
-            f"type={event.message.message_type} "
+            f"type={message_type} "
             f"text={text!r} "
-            f"normalized={normalized_text!r}"
+            f"normalized={normalized_text!r} "
+            f"image_key={image_key!r}"
         )
-        if not normalized_text:
+        if not normalized_text and not image_key:
             return
 
         if normalized_text.startswith("/bind"):
@@ -454,9 +553,12 @@ class FeishuCodexBridge:
             bound = self.state.bound_chat_id or "(未绑定)"
             active_task = self._active_task.task_id if self._active_task else "(无)"
             card_id = self._session_card_message_id or "(无)"
+            general_card_id = self._general_card_message_id or "(无)"
+            math_problem_id = self._math_problem.problem_id if self._math_problem else "(无)"
+            math_card_id = self._math_problem.card_message_id if self._math_problem else "(无)"
             self._send_text(
                 chat_id,
-                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nactive_task: {active_task}\nsession_card: {card_id}",
+                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nmath_tutor_mode: {self.math_tutor_mode}\nactive_task: {active_task}\nmath_problem: {math_problem_id}\ngeneral_card: {general_card_id}\ncodex_card: {card_id}\nmath_card: {math_card_id}",
             )
             return
 
@@ -464,9 +566,12 @@ class FeishuCodexBridge:
             bound = self.state.bound_chat_id or "(未绑定)"
             active_task = self._active_task.task_id if self._active_task else "(无)"
             card_id = self._session_card_message_id or "(无)"
+            general_card_id = self._general_card_message_id or "(无)"
+            math_problem_id = self._math_problem.problem_id if self._math_problem else "(无)"
+            math_card_id = self._math_problem.card_message_id if self._math_problem else "(无)"
             self._send_text(
                 chat_id,
-                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nactive_task: {active_task}\nsession_card: {card_id}",
+                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nmath_tutor_mode: {self.math_tutor_mode}\nactive_task: {active_task}\nmath_problem: {math_problem_id}\ngeneral_card: {general_card_id}\ncodex_card: {card_id}\nmath_card: {math_card_id}",
             )
             return
 
@@ -476,6 +581,7 @@ class FeishuCodexBridge:
 
         if normalized_text.startswith("/ctrlc"):
             self.shell.send_ctrl_c()
+            math_interrupted = self._interrupt_math_tutor()
             if self._active_task:
                 self._active_task.status = "interrupted"
                 self._append_status("本轮请求被 Ctrl+C 中断。")
@@ -483,26 +589,127 @@ class FeishuCodexBridge:
                     self._active_task.task_id,
                     lambda d: (d.__setitem__("status", "interrupted"), d.__setitem__("finished_at", datetime.now().isoformat(timespec="seconds"))),
                 )
+                self._flush_typewriter()
                 self._update_task_card(force=True)
             self._mobile_line_carry = ""
             if self.codex_mode and self._session_card_message_id:
                 self._append_status("已发送 Ctrl+C。")
+                self._flush_typewriter()
                 self._update_task_card(force=True)
+            if math_interrupted and self._math_problem and self._math_problem.card_message_id:
+                self._append_math_status("已发送 Ctrl+C。")
+                self._flush_math_typewriter()
+                self._update_math_card(force=True)
             else:
-                self._send_text(chat_id, "已发送 Ctrl+C")
+                if not self._active_task and not math_interrupted:
+                    self._send_text(chat_id, "已发送 Ctrl+C")
+            return
+
+        if normalized_text == "设置数学辅导提示词":
+            self._send_text(chat_id, "用法：设置数学辅导提示词 你的提示词")
+            return
+
+        if normalized_text.startswith("设置数学辅导提示词 "):
+            raw_prompt = text[len("设置数学辅导提示词"):].strip() if text.startswith("设置数学辅导提示词") else ""
+            prompt = raw_prompt or normalized_text[len("设置数学辅导提示词 "):].strip()
+            if not prompt:
+                self._send_text(chat_id, "用法：设置数学辅导提示词 你的提示词")
+                return
+            self.state.set_math_tutor_system_prompt(prompt)
+            self._send_text(chat_id, "数学辅导提示词已更新。")
+            return
+
+        if normalized_text == "查看数学辅导提示词":
+            self._send_text(chat_id, self._math_system_prompt())
+            return
+
+        if normalized_text == "清空数学辅导提示词":
+            self.state.set_math_tutor_system_prompt("")
+            self._send_text(chat_id, "数学辅导提示词已恢复为默认设置。")
+            return
+
+        if normalized_text.startswith("创建数学总结文档"):
+            raw_title = text[len("创建数学总结文档"):].strip() if text.startswith("创建数学总结文档") else ""
+            title = raw_title or normalized_text[len("创建数学总结文档"):].strip() or self.config.math_tutor_doc_title
+            document_id = self._create_math_summary_document(title)
+            if document_id:
+                self._send_text(chat_id, f"数学总结文档已创建：{document_id}")
+            else:
+                self._send_text(chat_id, "创建数学总结文档失败，请检查飞书文档权限。")
+            return
+
+        if normalized_text.startswith("绑定数学总结文档 "):
+            raw = normalized_text[len("绑定数学总结文档 "):].strip()
+            document_id = self._extract_document_id(raw)
+            if not document_id:
+                self._send_text(chat_id, "未识别到文档 ID。可直接发送 document_id，或发送包含 /docx/<id> 的链接。")
+                return
+            self.state.set_math_summary_doc(document_id)
+            self._send_text(chat_id, f"已绑定数学总结文档：{document_id}")
+            return
+
+        if normalized_text == "查看数学总结文档":
+            if self.state.math_summary_doc_id:
+                self._send_text(chat_id, f"当前数学总结文档：{self.state.math_summary_doc_id}")
+            else:
+                self._send_text(chat_id, "当前未绑定数学总结文档。可发送“创建数学总结文档”自动创建。")
+            return
+
+        if normalized_text == "关闭数学总结文档":
+            self.state.clear_math_summary_doc()
+            self._send_text(chat_id, "已关闭数学总结文档同步。")
+            return
+
+        if normalized_text == "教我做题":
+            if self.codex_mode:
+                self._send_text(chat_id, "当前在 Codex 对话模式。请先发送 /exitcodex，再进入数学辅导。")
+                return
+            if self.math_tutor_mode:
+                self._send_text(chat_id, "已在数学辅导模式。直接发送题目文字或图片即可。")
+                return
+            self.math_tutor_mode = True
+            self._send_text(chat_id, "已进入数学辅导模式。请发送题目文字或图片；发送“下一题”会开启新卡片。", force_new=True)
+            return
+
+        if normalized_text in {"退出做题", "结束做题", "退出数学辅导"}:
+            if not self.math_tutor_mode:
+                self._send_text(chat_id, "当前不在数学辅导模式。")
+                return
+            if self._is_math_running():
+                self._send_text(chat_id, "当前这道题仍在讲解中。请稍后，或先发送 /ctrlc。")
+                return
+            self._finalize_math_problem(sync_doc=True)
+            self.math_tutor_mode = False
+            self._send_text(chat_id, "已退出数学辅导模式。", force_new=True)
+            return
+
+        if normalized_text == "下一题":
+            if not self.math_tutor_mode:
+                self._send_text(chat_id, "请先发送“教我做题”进入数学辅导模式。")
+                return
+            if self._is_math_running():
+                self._send_text(chat_id, "当前这道题仍在讲解中。请稍后，或先发送 /ctrlc。")
+                return
+            self._finalize_math_problem(sync_doc=True)
+            self._send_text(chat_id, "已切换到下一题。请发送新的题目文字或图片。", force_new=True)
             return
 
         if normalized_text.startswith("/codex"):
             if not self._command_allowed("codex exec"):
                 self._send_text(chat_id, "命令被策略拒绝。")
                 return
+            if self.math_tutor_mode:
+                self._send_text(chat_id, "当前在数学辅导模式。请先发送“退出做题”，再进入 Codex 对话模式。")
+                return
+            if self.codex_mode:
+                if self._active_task and self._active_task.status == "running":
+                    self._send_text(chat_id, "已在 Codex 对话模式，当前任务仍在执行。")
+                else:
+                    self._send_text(chat_id, "已在 Codex 对话模式。直接发送自然语言消息即可创建新的任务卡片。")
+                return
             self.codex_mode = True
-            if not self._session_card_message_id:
-                self._append_status("会话已开启，等待请求。")
-                self._append_answer("_等待回答中..._")
-                self._session_card_message_id = self._send_session_card(chat_id)
-            self._append_status("已进入 Codex 对话模式（同一张卡片持续更新）。")
-            self._update_task_card(force=True)
+            self._reset_codex_card_state()
+            self._send_text(chat_id, "已进入 Codex 对话模式。后续每条自然语言消息会使用各自的任务卡片。", force_new=True)
             return
 
         if normalized_text.startswith("/exitcodex"):
@@ -513,17 +720,14 @@ class FeishuCodexBridge:
                     self._active_task.task_id,
                     lambda d: (d.__setitem__("status", "interrupted"), d.__setitem__("finished_at", datetime.now().isoformat(timespec="seconds"))),
                 )
+                self._flush_typewriter()
                 self._update_task_card(force=True)
             self.codex_mode = False
             self._mobile_line_carry = ""
             self._active_task = None
-            self._append_status("会话已退出。")
-            self._update_task_card(force=True)
-            self._session_card_message_id = ""
-            self._session_status_parts = []
-            self._session_answer_parts = []
+            self._reset_codex_card_state()
             self.shell.send_ctrl_c()
-            self._send_text(chat_id, "已退出 Codex 终端模式。")
+            self._send_text(chat_id, "已退出 Codex 终端模式。", force_new=True)
             return
 
         if normalized_text.startswith("/cmd"):
@@ -539,19 +743,31 @@ class FeishuCodexBridge:
             self._send_text(chat_id, f"$ {command}")
             return
 
+        if message_type == "image":
+            if self.math_tutor_mode:
+                self._handle_math_tutor_input(chat_id, sender_open_id or "", text="", image_key=image_key, message_id=message_id)
+            else:
+                self._send_text(chat_id, "当前仅数学辅导模式支持图片题。请先发送“教我做题”。")
+            return
+
+        if self.math_tutor_mode and normalized_text and not normalized_text.startswith("/"):
+            self._handle_math_tutor_input(chat_id, sender_open_id or "", text=normalized_text, image_key="", message_id=message_id)
+            return
+
         if self.codex_mode and not normalized_text.startswith("/"):
             if self._active_task and self._active_task.status == "running":
                 self._append_status("上一条请求仍在执行，请稍后或发送 /ctrlc。")
                 self._update_task_card(force=True)
                 return
+            self._reset_codex_card_state()
+            self._session_answer_parts = ["_等待回答中..._"]
             task = self._create_task(chat_id, sender_open_id or "", normalized_text)
             self._active_task = task
-            if not self._session_card_message_id:
-                self._session_card_message_id = self._send_session_card(chat_id)
-            task.card_message_id = self._session_card_message_id
-            self.history.update_task(task.task_id, lambda d, cid=self._session_card_message_id: d.__setitem__("card_message_id", cid))
             self._append_status(f"新请求：{normalized_text}")
             self._append_status("请求已接收，正在执行。")
+            self._session_card_message_id = self._send_session_card(chat_id)
+            task.card_message_id = self._session_card_message_id
+            self.history.update_task(task.task_id, lambda d, cid=self._session_card_message_id: d.__setitem__("card_message_id", cid))
             self._update_task_card(force=True)
             prompt = shlex.quote(normalized_text)
             self._log(f"[bridge] exec -> shell: codex exec --json --color never --skip-git-repo-check {prompt}")
@@ -589,6 +805,10 @@ class FeishuCodexBridge:
                         mobile_text = self._format_for_mobile(cleaned)
                         if mobile_text.strip():
                             self._send_bound_chat(mobile_text)
+            elif self.codex_mode and self._session_card_message_id and self._has_pending_typewriter():
+                self._update_task_card()
+            elif self._math_problem and self._math_problem.card_message_id and self._has_pending_math_typewriter():
+                self._update_math_card()
 
         if buffer.strip():
             cleaned = self._clean_output(buffer)
@@ -708,14 +928,85 @@ class FeishuCodexBridge:
         return task
 
     def _append_status(self, text: str) -> None:
-        self._session_status_parts.append(text)
-        if len(self._session_status_parts) > 500:
-            self._session_status_parts = self._session_status_parts[-500:]
+        if text.strip():
+            self._status_pending.append(text)
 
     def _append_answer(self, text: str) -> None:
-        self._session_answer_parts.append(text)
-        if len(self._session_answer_parts) > 300:
-            self._session_answer_parts = self._session_answer_parts[-300:]
+        if text.strip():
+            self._answer_pending.append(text)
+
+    def _reset_codex_card_state(self) -> None:
+        self._session_card_message_id = ""
+        self._session_status_parts = []
+        self._session_answer_parts = []
+        self._status_pending = []
+        self._answer_pending = []
+        self._status_typing_current = ""
+        self._answer_typing_current = ""
+        self._status_typing_index = 0
+        self._answer_typing_index = 0
+
+    def _reset_general_card_state(self) -> None:
+        self._general_card_message_id = ""
+        self._general_feed_parts = []
+
+    def _has_pending_typewriter(self) -> bool:
+        return bool(
+            self._status_pending
+            or self._answer_pending
+            or self._status_typing_current
+            or self._answer_typing_current
+        )
+
+    def _flush_typewriter(self) -> bool:
+        progressed = False
+        while self._advance_typewriter():
+            progressed = True
+        return progressed
+
+    def _advance_typewriter(self) -> bool:
+        progressed = False
+        progressed |= self._advance_status_typewriter()
+        progressed |= self._advance_answer_typewriter()
+        return progressed
+
+    def _advance_status_typewriter(self) -> bool:
+        if not self._status_typing_current and self._status_pending:
+            self._status_typing_current = self._status_pending.pop(0)
+            self._status_typing_index = 0
+            self._session_status_parts.append("")
+        if not self._status_typing_current:
+            return False
+        step = max(1, self.config.typewriter_status_chars_per_tick)
+        end = min(len(self._status_typing_current), self._status_typing_index + step)
+        self._session_status_parts[-1] = self._status_typing_current[:end]
+        self._status_typing_index = end
+        if end >= len(self._status_typing_current):
+            self._status_typing_current = ""
+            self._status_typing_index = 0
+            if len(self._session_status_parts) > 500:
+                self._session_status_parts = self._session_status_parts[-500:]
+        return True
+
+    def _advance_answer_typewriter(self) -> bool:
+        if not self._answer_typing_current and self._answer_pending:
+            self._answer_typing_current = self._answer_pending.pop(0)
+            self._answer_typing_index = 0
+            if self._session_answer_parts == ["_等待回答中..._"]:
+                self._session_answer_parts = []
+            self._session_answer_parts.append("")
+        if not self._answer_typing_current:
+            return False
+        step = max(1, self.config.typewriter_answer_chars_per_tick)
+        end = min(len(self._answer_typing_current), self._answer_typing_index + step)
+        self._session_answer_parts[-1] = self._answer_typing_current[:end]
+        self._answer_typing_index = end
+        if end >= len(self._answer_typing_current):
+            self._answer_typing_current = ""
+            self._answer_typing_index = 0
+            if len(self._session_answer_parts) > 300:
+                self._session_answer_parts = self._session_answer_parts[-300:]
+        return True
 
     def _render_session_sections(self) -> tuple[str, str]:
         status_source = self._session_status_parts[-max(1, self.config.card_status_max_lines):]
@@ -747,33 +1038,24 @@ class FeishuCodexBridge:
     def _update_task_card(self, force: bool = False) -> None:
         if not self._session_card_message_id:
             return
+        progressed = self._advance_typewriter()
         now = time.monotonic()
         if self._active_task and not force and (now - self._active_task.last_card_push_ts) < self.config.card_update_interval_seconds:
             return
+        if not force and not progressed:
+            return
         status_md, answer_md = self._render_session_sections()
-        content = self._template_card_content(raw_text="", status_text=status_md, answer_text=answer_md)
-        req = (
-            PatchMessageRequest.builder()
-            .message_id(self._session_card_message_id)
-            .request_body(
-                PatchMessageRequestBody.builder()
-                .content(json.dumps(content, ensure_ascii=False))
-                .build()
-            )
-            .build()
-        )
-        resp = self.api_client.im.v1.message.patch(req)
-        if resp.success():
+        if self._patch_card_message(self._session_card_message_id, raw_text="", status_text=status_md, answer_text=answer_md):
             if self._active_task:
                 self._active_task.last_card_push_ts = now
                 self.history.update_task(self._active_task.task_id, lambda d: d.__setitem__("updated_at", datetime.now().isoformat(timespec="seconds")))
                 self._log(f"[bridge] card updated message_id={self._session_card_message_id} task_id={self._active_task.task_id}")
             else:
                 self._log(f"[bridge] card updated message_id={self._session_card_message_id}")
-        else:
-            self._log(
-                f"[bridge] card update failed task_id={self._active_task.task_id if self._active_task else '-'} code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
-            )
+            return
+        self._log(
+            f"[bridge] card update failed task_id={self._active_task.task_id if self._active_task else '-'} message_id={self._session_card_message_id}"
+        )
 
     def _process_codex_chunk(self, text: str, flush_tail: bool = False) -> None:
         data = self._mobile_line_carry + text
@@ -805,7 +1087,8 @@ class FeishuCodexBridge:
             value = event.get("value", "")
             if kind == "command_started" and value:
                 task.commands.append(value)
-                self._append_status(f"命令执行中：`{value}`")
+                status_cmd = self._format_status_command(value)
+                self._append_status(f"命令执行中：`{status_cmd}`")
                 self._log(f"[bridge] task command_started task_id={task.task_id} command={value}")
                 self.history.update_task(
                     task.task_id,
@@ -814,8 +1097,6 @@ class FeishuCodexBridge:
                 changed = True
             elif kind == "agent_message" and value:
                 task.answer_parts.append(value)
-                if self._session_answer_parts == ["_等待回答中..._"]:
-                    self._session_answer_parts = []
                 self._append_answer(value)
                 self._log(f"[bridge] task agent_message task_id={task.task_id} size={len(value)}")
                 self.history.update_task(
@@ -836,6 +1117,7 @@ class FeishuCodexBridge:
         if changed:
             self._update_task_card()
         if task.status == "completed":
+            self._flush_typewriter()
             self._update_task_card(force=True)
             self._active_task = None
 
@@ -847,6 +1129,8 @@ class FeishuCodexBridge:
         except Exception:
             return None
         event_type = str(obj.get("type") or "")
+        if event_type == "thread.started":
+            return {"kind": "thread_started", "value": str(obj.get("thread_id") or "").strip()}
         if event_type == "turn.completed":
             return {"kind": "completed", "value": ""}
         item = obj.get("item")
@@ -858,6 +1142,16 @@ class FeishuCodexBridge:
         if event_type == "item.completed" and item_type == "agent_message":
             return {"kind": "agent_message", "value": str(item.get("text") or "").strip()}
         return None
+
+    @staticmethod
+    def _format_status_command(command: str) -> str:
+        cmd = command.strip().replace("\n", " ")
+        m = re.match(r"^/bin/(?:zsh|bash)\s+-lc\s+'(.*)'$", cmd)
+        if m:
+            cmd = m.group(1)
+        if len(cmd) > 180:
+            cmd = cmd[:180] + "..."
+        return cmd
 
     def _handle_history_command(self, chat_id: str, normalized_text: str) -> None:
         parts = normalized_text.split()
@@ -895,6 +1189,580 @@ class FeishuCodexBridge:
         )
         self._send_text(chat_id, body)
 
+    def _create_math_problem(self, chat_id: str, sender_open_id: str) -> MathTutorProblem:
+        self._math_problem_counter += 1
+        now = datetime.now().isoformat(timespec="seconds")
+        problem = MathTutorProblem(
+            problem_id=datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8],
+            problem_index=self._math_problem_counter,
+            chat_id=chat_id,
+            sender_open_id=sender_open_id,
+            status="idle",
+            started_at=now,
+            updated_at=now,
+            finished_at="",
+            thread_id="",
+            card_message_id="",
+            last_card_push_ts=0.0,
+            user_inputs=[],
+            answer_parts=[],
+            image_paths=[],
+            doc_synced=False,
+        )
+        self._math_problem = problem
+        self._reset_math_card_state()
+        self._math_answer_parts = ["_等待讲解中..._"]
+        return problem
+
+    def _reset_math_card_state(self) -> None:
+        self._math_status_parts = []
+        self._math_answer_parts = []
+        self._math_status_pending = []
+        self._math_answer_pending = []
+        self._math_status_typing_current = ""
+        self._math_answer_typing_current = ""
+        self._math_status_typing_index = 0
+        self._math_answer_typing_index = 0
+
+    def _append_math_status(self, text: str) -> None:
+        if text.strip():
+            self._math_status_pending.append(text)
+
+    def _append_math_answer(self, text: str) -> None:
+        if text.strip():
+            self._math_answer_pending.append(text)
+
+    def _has_pending_math_typewriter(self) -> bool:
+        return bool(
+            self._math_status_pending
+            or self._math_answer_pending
+            or self._math_status_typing_current
+            or self._math_answer_typing_current
+        )
+
+    def _flush_math_typewriter(self) -> bool:
+        progressed = False
+        while self._advance_math_typewriter():
+            progressed = True
+        return progressed
+
+    def _advance_math_typewriter(self) -> bool:
+        progressed = False
+        progressed |= self._advance_math_status_typewriter()
+        progressed |= self._advance_math_answer_typewriter()
+        return progressed
+
+    def _advance_math_status_typewriter(self) -> bool:
+        if not self._math_status_typing_current and self._math_status_pending:
+            self._math_status_typing_current = self._math_status_pending.pop(0)
+            self._math_status_typing_index = 0
+            self._math_status_parts.append("")
+        if not self._math_status_typing_current:
+            return False
+        step = max(1, self.config.typewriter_status_chars_per_tick)
+        end = min(len(self._math_status_typing_current), self._math_status_typing_index + step)
+        self._math_status_parts[-1] = self._math_status_typing_current[:end]
+        self._math_status_typing_index = end
+        if end >= len(self._math_status_typing_current):
+            self._math_status_typing_current = ""
+            self._math_status_typing_index = 0
+            if len(self._math_status_parts) > 500:
+                self._math_status_parts = self._math_status_parts[-500:]
+        return True
+
+    def _advance_math_answer_typewriter(self) -> bool:
+        if not self._math_answer_typing_current and self._math_answer_pending:
+            self._math_answer_typing_current = self._math_answer_pending.pop(0)
+            self._math_answer_typing_index = 0
+            if self._math_answer_parts == ["_等待讲解中..._"]:
+                self._math_answer_parts = []
+            self._math_answer_parts.append("")
+        if not self._math_answer_typing_current:
+            return False
+        step = max(1, self.config.typewriter_answer_chars_per_tick)
+        end = min(len(self._math_answer_typing_current), self._math_answer_typing_index + step)
+        self._math_answer_parts[-1] = self._math_answer_typing_current[:end]
+        self._math_answer_typing_index = end
+        if end >= len(self._math_answer_typing_current):
+            self._math_answer_typing_current = ""
+            self._math_answer_typing_index = 0
+            if len(self._math_answer_parts) > 300:
+                self._math_answer_parts = self._math_answer_parts[-300:]
+        return True
+
+    def _render_math_sections(self) -> tuple[str, str]:
+        status_source = self._math_status_parts[-max(1, self.config.card_status_max_lines):]
+        status_lines = []
+        for idx, item in enumerate(status_source, start=1):
+            safe_item = item.replace("`", "'")
+            status_lines.append(f"{idx}. {safe_item}")
+        dropped_status = max(0, len(self._math_status_parts) - len(status_source))
+        if dropped_status > 0:
+            status_lines.insert(0, f"_已折叠更早状态 {dropped_status} 条_")
+        if not status_lines:
+            status_lines.append("- 暂无状态")
+
+        answer = self._normalize_math_markdown_for_card("".join(self._math_answer_parts).strip())
+        if not answer:
+            answer = "_等待讲解中..._"
+        if len(answer) > self.config.card_answer_max_chars:
+            answer = "_已折叠更早讲解内容_\n\n" + answer[-self.config.card_answer_max_chars :]
+        return "\n".join(status_lines), answer
+
+    def _send_math_card(self, chat_id: str) -> str:
+        status_md, answer_md = self._render_math_sections()
+        return self._send_template_card(chat_id, raw_text="", status_text=status_md, answer_text=answer_md)
+
+    def _update_math_card(self, force: bool = False) -> None:
+        problem = self._math_problem
+        if not problem or not problem.card_message_id:
+            return
+        progressed = self._advance_math_typewriter()
+        now = time.monotonic()
+        if not force and (now - problem.last_card_push_ts) < self.config.card_update_interval_seconds:
+            return
+        if not force and not progressed:
+            return
+        status_md, answer_md = self._render_math_sections()
+        if self._patch_card_message(problem.card_message_id, raw_text="", status_text=status_md, answer_text=answer_md):
+            problem.last_card_push_ts = now
+            return
+        self._log(f"[bridge] math card update failed problem_id={problem.problem_id} message_id={problem.card_message_id}")
+
+    def _handle_math_tutor_input(self, chat_id: str, sender_open_id: str, text: str, image_key: str, message_id: str) -> None:
+        if not text and not image_key:
+            return
+        if self._is_math_running():
+            if self._math_problem:
+                self._append_math_status("上一条讲解仍在生成，请稍后或发送 /ctrlc。")
+                self._update_math_card(force=True)
+            else:
+                self._send_text(chat_id, "上一条讲解仍在生成，请稍后或发送 /ctrlc。")
+            return
+
+        problem = self._math_problem
+        if not problem:
+            problem = self._create_math_problem(chat_id, sender_open_id)
+
+        image_path = ""
+        if image_key:
+            image_path = self._download_message_image(message_id=message_id, image_key=image_key)
+            if not image_path:
+                self._send_text(chat_id, "下载题目图片失败，请稍后重试。")
+                return
+            problem.image_paths.append(image_path)
+            problem.user_inputs.append(f"[题图] {Path(image_path).name}")
+            self._append_math_status(f"收到第 {problem.problem_index} 题图片。")
+        if text:
+            problem.user_inputs.append(text)
+            self._append_math_status(f"收到文字：{text}")
+
+        if not problem.card_message_id:
+            self._append_math_status(f"第 {problem.problem_index} 题开始讲解。")
+            problem.card_message_id = self._send_math_card(chat_id)
+        if problem.thread_id:
+            self._append_math_status("继续讲解当前这道题。")
+        problem.status = "running"
+        problem.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._append_math_status("正在生成讲解。")
+        self._update_math_card(force=True)
+
+        thread = threading.Thread(
+            target=self._run_math_tutor_turn,
+            args=(problem, text, image_path),
+            daemon=True,
+        )
+        self._math_runner_thread = thread
+        thread.start()
+
+    def _run_math_tutor_turn(self, problem: MathTutorProblem, text: str, image_path: str) -> None:
+        prompt = self._build_math_tutor_prompt(problem, text=text, has_image=bool(image_path))
+        command = self._math_codex_command(problem.thread_id, prompt, [image_path] if image_path else [])
+        self._log(f"[bridge] math exec -> {' '.join(shlex.quote(part) for part in command)}")
+        process = None
+        interrupted = False
+        try:
+            process = pexpect.spawn(
+                "/bin/zsh",
+                ["-lc", " ".join(shlex.quote(part) for part in command)],
+                encoding="utf-8",
+                echo=False,
+                codec_errors="ignore",
+                cwd=os.getcwd(),
+            )
+            with self._math_lock:
+                self._math_process = process
+
+            header_buffer = ""
+            answer_started = False
+            while True:
+                try:
+                    chunk = process.read_nonblocking(size=512, timeout=0.2)
+                except pexpect.TIMEOUT:
+                    if not self._math_process_alive(process):
+                        break
+                    continue
+                except pexpect.EOF:
+                    break
+
+                cleaned = ANSI_RE.sub("", chunk).replace("\r\n", "\n").replace("\r", "\n")
+                if not cleaned:
+                    continue
+                self._log(f"[bridge] math raw output: {cleaned.rstrip()}")
+
+                if not answer_started:
+                    header_buffer += cleaned
+                    if not problem.thread_id:
+                        match = re.search(r"session id:\s*([0-9a-f-]+)", header_buffer, re.IGNORECASE)
+                        if match:
+                            problem.thread_id = match.group(1).strip()
+                            self._append_math_status("已建立数学辅导会话。")
+                            self._update_math_card()
+                    marker_index = header_buffer.find("\ncodex\n")
+                    if marker_index < 0 and header_buffer.startswith("codex\n"):
+                        marker_index = 0
+                    if marker_index >= 0:
+                        answer_started = True
+                        answer_text = header_buffer[marker_index + len("\ncodex\n") :] if marker_index > 0 else header_buffer[len("codex\n") :]
+                        header_buffer = ""
+                        if answer_text:
+                            problem.answer_parts.append(answer_text)
+                            self._append_math_answer(answer_text)
+                            self._update_math_card()
+                    else:
+                        header_buffer = header_buffer[-4000:]
+                    continue
+
+                problem.answer_parts.append(cleaned)
+                self._append_math_answer(cleaned)
+                self._update_math_card()
+
+            process.close()
+            rc = process.exitstatus if process.exitstatus is not None else process.signalstatus
+            interrupted = bool(process.signalstatus)
+            if rc not in (0, None) and problem.status != "completed":
+                self._append_math_status(f"讲解进程退出，返回码 {rc}。")
+        except Exception as exc:
+            self._append_math_status(f"数学辅导执行失败：{exc}")
+        finally:
+            with self._math_lock:
+                if self._math_process is process:
+                    self._math_process = None
+            if problem.status != "completed" and not interrupted:
+                problem.status = "completed"
+                problem.finished_at = datetime.now().isoformat(timespec="seconds")
+                self._append_math_status("本轮讲解完成。")
+            problem.updated_at = datetime.now().isoformat(timespec="seconds")
+            self._flush_math_typewriter()
+            self._update_math_card(force=True)
+
+    def _is_math_running(self) -> bool:
+        with self._math_lock:
+            process = self._math_process
+        return self._math_process_alive(process)
+
+    def _interrupt_math_tutor(self) -> bool:
+        with self._math_lock:
+            process = self._math_process
+        if not self._math_process_alive(process):
+            return False
+        try:
+            self._terminate_math_process(process)
+        except Exception:
+            return False
+        if self._math_problem:
+            self._math_problem.status = "interrupted"
+            self._math_problem.finished_at = datetime.now().isoformat(timespec="seconds")
+            self._append_math_status("本轮讲解被 Ctrl+C 中断。")
+        return True
+
+    @staticmethod
+    def _math_process_alive(process: object) -> bool:
+        if process is None:
+            return False
+        if hasattr(process, "isalive"):
+            try:
+                return bool(process.isalive())
+            except Exception:
+                return False
+        if hasattr(process, "poll"):
+            try:
+                return process.poll() is None
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
+    def _terminate_math_process(process: object) -> None:
+        if hasattr(process, "terminate"):
+            try:
+                process.terminate(force=True)
+                return
+            except TypeError:
+                process.terminate()
+                return
+        if hasattr(process, "kill"):
+            process.kill()
+
+    def _finalize_math_problem(self, sync_doc: bool) -> None:
+        problem = self._math_problem
+        if not problem:
+            return
+        if sync_doc:
+            self._sync_math_problem_to_doc(problem)
+        self._math_problem = None
+        self._math_runner_thread = None
+        self._reset_math_card_state()
+
+    def _math_system_prompt(self) -> str:
+        custom_prompt = self.state.math_tutor_system_prompt or self.config.math_tutor_system_prompt
+        base_prompt = custom_prompt.strip() or (
+            "你是一名严谨、耐心的数学辅导老师。你的目标是帮助学生学会做题，而不是只给结论。"
+        )
+        fixed_rules = (
+            "固定要求：\n"
+            "1. 全程使用中文。\n"
+            "2. 使用 Markdown 输出。\n"
+            "3. 所有公式统一使用单个 $...$，不要使用 $$...$$、\\[...\\]、\\(...\\)。\n"
+            "4. 先识别题意，再分步讲解，最后给出结论。\n"
+            "5. 如果学生发来图片，先简要转写题目再讲解。\n"
+            "6. 优先给出可学习、可复用的解题思路。\n"
+            "7. 说明性中文不要放进公式内部，例如不要输出 $\\text{计算极限 ...}$。\n"
+            "8. 不要执行与解题无关的 shell 命令。"
+        )
+        return f"{base_prompt}\n\n{fixed_rules}"
+
+    def _build_math_tutor_prompt(self, problem: MathTutorProblem, text: str, has_image: bool) -> str:
+        if not problem.thread_id:
+            parts = [
+                "[数学辅导系统提示词]",
+                self._math_system_prompt(),
+                "",
+                "[题目上下文]",
+            ]
+        else:
+            parts = [
+                "继续围绕同一道数学题辅导学生。",
+                "仍然使用中文 Markdown 输出，所有公式继续统一使用单个 $...$。",
+                "",
+                "[学生新消息]",
+            ]
+        if text:
+            parts.append(text)
+        if has_image:
+            parts.append("学生附带了一张新的题目图片，请结合图片内容继续讲解。")
+        return "\n".join(parts).strip()
+
+    def _math_codex_command(self, thread_id: str, prompt: str, image_paths: list[str]) -> list[str]:
+        command = ["codex", "exec"]
+        if thread_id:
+            command.append("resume")
+            command.extend(["--skip-git-repo-check"])
+        else:
+            command.extend(["--color", "never", "--skip-git-repo-check", "-s", "read-only"])
+        for image_path in image_paths:
+            if image_path:
+                command.extend(["--image", image_path])
+        if thread_id:
+            command.extend(["--", thread_id, prompt])
+        else:
+            command.extend(["--", prompt])
+        return command
+
+    @classmethod
+    def _normalize_math_markdown_for_card(cls, text: str) -> str:
+        if not text:
+            return ""
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(r"\$\$(.*?)\$\$", lambda m: cls._format_math_block_for_card(m.group(1)), normalized, flags=re.S)
+        normalized = re.sub(r"\\\[(.*?)\\\]", lambda m: cls._format_math_block_for_card(m.group(1)), normalized, flags=re.S)
+        normalized = re.sub(r"\\\((.*?)\\\)", lambda m: cls._format_math_inline_for_card(m.group(1)), normalized, flags=re.S)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
+
+    @classmethod
+    def _format_math_block_for_card(cls, body: str) -> str:
+        content = re.sub(r"\s+", " ", body.strip())
+        if not content:
+            return ""
+        match = re.match(r"\\text\{([^{}]+)\}\s*(.*)$", content)
+        if match:
+            prefix = match.group(1).strip()
+            rest = match.group(2).strip()
+            if rest:
+                return f"{prefix} {cls._format_math_inline_for_card(rest)}"
+            return prefix
+        return cls._format_math_inline_for_card(content)
+
+    @staticmethod
+    def _format_math_inline_for_card(body: str) -> str:
+        content = re.sub(r"\s+", " ", body.strip())
+        if not content:
+            return ""
+        return f"$ {content} $"
+
+    def _download_message_image(self, message_id: str, image_key: str) -> str:
+        resp = None
+        if message_id:
+            req = (
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(image_key)
+                .type("image")
+                .build()
+            )
+            resp = self.api_client.im.v1.message_resource.get(req)
+            if resp.success() and getattr(resp, "file", None):
+                return self._save_binary_asset(resp.file, getattr(resp, "file_name", "") or f"{image_key}.png")
+            self._log(
+                f"[bridge] message resource image download failed message_id={message_id} image_key={image_key} "
+                f"code={resp.code} msg={resp.msg}"
+            )
+
+        req = GetImageRequest.builder().image_key(image_key).build()
+        resp = self.api_client.im.v1.image.get(req)
+        if not resp.success() or not getattr(resp, "file", None):
+            self._log(f"[bridge] download image failed message_id={message_id} image_key={image_key} code={resp.code} msg={resp.msg}")
+            return ""
+        return self._save_binary_asset(resp.file, getattr(resp, "file_name", "") or f"{image_key}.png")
+
+    def _save_binary_asset(self, file_obj, file_name: str) -> str:
+        suffix = Path(file_name or "image.png").suffix or ".png"
+        file_path = self._math_asset_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}{suffix}"
+        with file_path.open("wb") as f:
+            f.write(file_obj.read())
+        return str(file_path)
+
+    def _create_math_summary_document(self, title: str) -> str:
+        req_body = CreateDocumentRequestBody.builder().title(title).build()
+        if self.config.math_tutor_doc_folder_token:
+            req_body.folder_token = self.config.math_tutor_doc_folder_token
+        req = CreateDocumentRequest.builder().request_body(req_body).build()
+        resp = self.api_client.docx.v1.document.create(req)
+        if not resp.success() or not resp.data or not resp.data.document:
+            self._log(f"[bridge] create math doc failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
+            return ""
+        document_id = resp.data.document.document_id or ""
+        if document_id:
+            self.state.set_math_summary_doc(document_id, title)
+        return document_id
+
+    def _ensure_math_summary_document(self) -> str:
+        return self.state.math_summary_doc_id
+
+    def _sync_math_problem_to_doc(self, problem: MathTutorProblem) -> None:
+        if problem.doc_synced:
+            return
+        if not problem.user_inputs and not problem.answer_parts:
+            return
+        document_id = self._ensure_math_summary_document()
+        if not document_id:
+            return
+        markdown = self._build_math_summary_markdown(problem)
+        blocks = self._convert_markdown_to_blocks(markdown)
+        if not blocks:
+            self._append_math_status("同步飞书文档失败：Markdown 转块失败。")
+            self._flush_math_typewriter()
+            self._update_math_card(force=True)
+            return
+        index = self._document_child_count(document_id)
+        req = (
+            CreateDocumentBlockChildrenRequest.builder()
+            .document_id(document_id)
+            .block_id(document_id)
+            .document_revision_id(-1)
+            .request_body(
+                CreateDocumentBlockChildrenRequestBody.builder()
+                .children(blocks)
+                .index(index)
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.docx.v1.document_block_children.create(req)
+        if not resp.success():
+            self._append_math_status("同步飞书文档失败：写入文档接口报错。")
+            self._log(f"[bridge] append math doc failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
+            self._flush_math_typewriter()
+            self._update_math_card(force=True)
+            return
+        problem.doc_synced = True
+        self._append_math_status(f"本题已同步到飞书文档：{document_id}")
+        self._flush_math_typewriter()
+        self._update_math_card(force=True)
+
+    def _convert_markdown_to_blocks(self, markdown: str) -> list:
+        req = (
+            ConvertDocumentRequest.builder()
+            .request_body(
+                ConvertDocumentRequestBody.builder()
+                .content_type("markdown")
+                .content(markdown)
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.docx.v1.document.convert(req)
+        if not resp.success() or not resp.data:
+            self._log(f"[bridge] convert markdown failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
+            return []
+        return list(resp.data.blocks or [])
+
+    def _document_child_count(self, document_id: str) -> int:
+        page_token = ""
+        count = 0
+        while True:
+            builder = (
+                GetDocumentBlockChildrenRequest.builder()
+                .document_id(document_id)
+                .block_id(document_id)
+                .page_size(200)
+            )
+            if page_token:
+                builder.page_token(page_token)
+            resp = self.api_client.docx.v1.document_block_children.get(builder.build())
+            if not resp.success() or not resp.data:
+                self._log(f"[bridge] list doc children failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
+                return count
+            items = list(resp.data.items or [])
+            count += len(items)
+            if not getattr(resp.data, "has_more", False):
+                return count
+            page_token = getattr(resp.data, "page_token", "") or ""
+            if not page_token:
+                return count
+
+    def _build_math_summary_markdown(self, problem: MathTutorProblem) -> str:
+        question_lines = []
+        for idx, item in enumerate(problem.user_inputs, start=1):
+            question_lines.append(f"{idx}. {item}")
+        if problem.image_paths:
+            question_lines.append(f"- 学生共发送题图 {len(problem.image_paths)} 张。")
+        answer = "\n\n---\n\n".join([part for part in problem.answer_parts if part.strip()]).strip() or "（暂无解答）"
+        title = f"第 {problem.problem_index} 题"
+        return (
+            f"# {title}\n\n"
+            f"- 时间：{problem.started_at}\n"
+            f"- 问题 ID：`{problem.problem_id}`\n\n"
+            "## 题目内容\n\n"
+            f"{chr(10).join(question_lines) if question_lines else '（用户未提供文字题面）'}\n\n"
+            "## 讲解与解答\n\n"
+            f"{answer}\n"
+        )
+
+    @staticmethod
+    def _extract_document_id(raw: str) -> str:
+        text = raw.strip()
+        if not text:
+            return ""
+        match = re.search(r"/docx/([A-Za-z0-9]+)", text)
+        if match:
+            return match.group(1)
+        match = re.search(r"\b([A-Za-z0-9]{10,})\b", text)
+        if match:
+            return match.group(1)
+        return ""
+
     def _extract_text(self, message_type: Optional[str], content: Optional[str]) -> str:
         if message_type != "text" or not content:
             return ""
@@ -903,6 +1771,15 @@ class FeishuCodexBridge:
             return str(body.get("text", "")).strip()
         except Exception:
             return ""
+
+    def _extract_image_key(self, message_type: Optional[str], content: Optional[str]) -> str:
+        if message_type != "image" or not content:
+            return ""
+        try:
+            body = json.loads(content)
+        except Exception:
+            return ""
+        return str(body.get("image_key") or "").strip()
 
     def _normalize_incoming_text(self, text: str) -> str:
         if not text:
@@ -923,11 +1800,18 @@ class FeishuCodexBridge:
             "/bind - 绑定当前会话为推送目标\n"
             "/status - 查看 bridge 状态\n"
             "/cmd <command> - 在本地终端执行命令\n"
-            "/codex - 进入 Codex 对话模式（每条自然语言触发一次 codex exec --json）\n"
+            "/codex - 进入 Codex 对话模式（每条自然语言触发一次 codex exec --json，并使用独立任务卡片）\n"
             "/exitcodex - 退出 Codex 对话模式\n"
+            "教我做题 - 进入数学辅导模式（支持文字题和图片题）\n"
+            "下一题 - 在数学辅导模式下开启新题，下一题使用新卡片\n"
+            "结束做题 - 退出数学辅导模式\n"
+            "设置数学辅导提示词 <内容> - 更新数学辅导系统提示词\n"
+            "查看数学辅导提示词 / 清空数学辅导提示词 - 查看或恢复默认提示词\n"
+            "创建数学总结文档 [标题] / 绑定数学总结文档 <doc_id> - 配置飞书文档总结（在下一题/结束做题时追加）\n"
+            "查看数学总结文档 / 关闭数学总结文档 - 查看或关闭文档同步\n"
             "/history - 查看最近任务；/history <task_id> 查看详情；/history clear 清空历史\n"
             "/ctrlc - 给终端发送 Ctrl+C\n"
-            "说明: Codex 模式下会持续更新同一张卡片，直到 /exitcodex"
+            "说明: 普通模式复用同一张系统卡片；Codex 模式按请求分卡；数学辅导模式按“题目”分卡，同题追问继续写入同一卡片"
         )
 
     def _send_bound_chat(self, text: str) -> None:
@@ -935,38 +1819,83 @@ class FeishuCodexBridge:
             return
         self._send_text(self.state.bound_chat_id, text)
 
-    def _send_text(self, chat_id: str, text: str) -> None:
+    def _send_text(self, chat_id: str, text: str, force_new: bool = False) -> None:
         try:
-            # Try markdown-rendered interactive card first.
-            if self._send_markdown(chat_id, text):
+            if self._upsert_general_card(chat_id, text, force_new=force_new):
                 return
-
-            # Fallback to post-richtext rendering before plain text.
-            if self._send_post(chat_id, text):
-                return
-
-            # Last fallback to plain text.
-            req = (
-                CreateMessageRequest.builder()
-                .receive_id_type("chat_id")
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(chat_id)
-                    .msg_type("text")
-                    .content(json.dumps({"text": text}, ensure_ascii=False))
-                    .build()
-                )
-                .build()
-            )
-            resp = self.api_client.im.v1.message.create(req)
-            if not resp.success():
-                self._log(
-                    f"[bridge] send failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
-                )
-            else:
-                self._log(f"[bridge] send ok(text) chat_id={chat_id} size={len(text)}")
+            self._send_text_standalone(chat_id, text)
         except Exception as exc:
             self._log(f"[bridge] send exception chat_id={chat_id} err={exc}")
+
+    def _upsert_general_card(self, chat_id: str, text: str, force_new: bool = False) -> bool:
+        if not text.strip() or not self.config.card_template_id:
+            return False
+        if force_new:
+            self._reset_general_card_state()
+        self._general_feed_parts.append(text)
+        if len(self._general_feed_parts) > 120:
+            self._general_feed_parts = self._general_feed_parts[-120:]
+        status_md, answer_md = self._render_general_sections()
+        if self._general_card_message_id and self._patch_card_message(
+            self._general_card_message_id,
+            raw_text="",
+            status_text=status_md,
+            answer_text=answer_md,
+        ):
+            self._log(f"[bridge] general card updated message_id={self._general_card_message_id}")
+            return True
+        msg_id = self._send_template_card(chat_id, raw_text=text, status_text=status_md, answer_text=answer_md)
+        if not msg_id:
+            return False
+        self._general_card_message_id = msg_id
+        return True
+
+    def _render_general_sections(self) -> tuple[str, str]:
+        items = self._general_feed_parts[-12:]
+        dropped = max(0, len(self._general_feed_parts) - len(items))
+        if self.math_tutor_mode:
+            mode_text = "数学辅导中"
+        elif self.codex_mode:
+            mode_text = "Codex 对话中"
+        else:
+            mode_text = "普通终端模式"
+        status_lines = [f"系统消息面板", f"当前模式: {mode_text}"]
+        if dropped > 0:
+            status_lines.append(f"_已折叠更早消息 {dropped} 条_")
+        answer = "\n\n---\n\n".join(item.strip() for item in items if item.strip()).strip()
+        if not answer:
+            answer = "_暂无消息_"
+        if len(answer) > self.config.card_answer_max_chars:
+            answer = (
+                "_已折叠更早系统消息内容_\n\n"
+                + answer[-self.config.card_answer_max_chars :]
+            )
+        return "\n".join(status_lines), answer
+
+    def _send_text_standalone(self, chat_id: str, text: str) -> None:
+        if self._send_markdown(chat_id, text):
+            return
+        if self._send_post(chat_id, text):
+            return
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.create(req)
+        if not resp.success():
+            self._log(
+                f"[bridge] send failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+            )
+            return
+        self._log(f"[bridge] send ok(text) chat_id={chat_id} size={len(text)}")
 
     def _send_markdown(self, chat_id: str, text: str) -> bool:
         msg_id = self._send_template_card(
@@ -976,6 +1905,26 @@ class FeishuCodexBridge:
             answer_text=text,
         )
         return bool(msg_id)
+
+    def _patch_card_message(self, message_id: str, raw_text: str, status_text: str = "", answer_text: str = "") -> bool:
+        content = self._template_card_content(raw_text=raw_text, status_text=status_text, answer_text=answer_text)
+        req = (
+            PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .content(json.dumps(content, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.patch(req)
+        if resp.success():
+            return True
+        self._log(
+            f"[bridge] patch failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()} message_id={message_id}"
+        )
+        return False
 
     def _template_card_content(self, raw_text: str, status_text: str = "", answer_text: str = "") -> dict:
         safe_raw = raw_text if raw_text.strip() else " "
