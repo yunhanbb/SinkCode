@@ -26,6 +26,8 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
 )
 from lark_oapi.api.docx.v1 import (
+    BatchDeleteDocumentBlockChildrenRequest,
+    BatchDeleteDocumentBlockChildrenRequestBody,
     ConvertDocumentRequest,
     ConvertDocumentRequestBody,
     CreateDocumentBlockChildrenRequest,
@@ -220,6 +222,9 @@ class MathTutorProblem:
     answer_parts: list[str]
     image_paths: list[str]
     doc_synced: bool
+    doc_document_id: str
+    doc_start_index: int
+    doc_block_count: int
 
 
 class HistoryStore:
@@ -1208,6 +1213,9 @@ class FeishuCodexBridge:
             answer_parts=[],
             image_paths=[],
             doc_synced=False,
+            doc_document_id="",
+            doc_start_index=-1,
+            doc_block_count=0,
         )
         self._math_problem = problem
         self._reset_math_card_state()
@@ -1352,9 +1360,11 @@ class FeishuCodexBridge:
                 return
             problem.image_paths.append(image_path)
             problem.user_inputs.append(f"[题图] {Path(image_path).name}")
+            problem.doc_synced = False
             self._append_math_status(f"收到第 {problem.problem_index} 题图片。")
         if text:
             problem.user_inputs.append(text)
+            problem.doc_synced = False
             self._append_math_status(f"收到文字：{text}")
 
         if not problem.card_message_id:
@@ -1381,6 +1391,7 @@ class FeishuCodexBridge:
         self._log(f"[bridge] math exec -> {' '.join(shlex.quote(part) for part in command)}")
         process = None
         interrupted = False
+        turn_answer_parts: list[str] = []
         try:
             process = pexpect.spawn(
                 "/bin/zsh",
@@ -1426,14 +1437,14 @@ class FeishuCodexBridge:
                         answer_text = header_buffer[marker_index + len("\ncodex\n") :] if marker_index > 0 else header_buffer[len("codex\n") :]
                         header_buffer = ""
                         if answer_text:
-                            problem.answer_parts.append(answer_text)
+                            turn_answer_parts.append(answer_text)
                             self._append_math_answer(answer_text)
                             self._update_math_card()
                     else:
                         header_buffer = header_buffer[-4000:]
                     continue
 
-                problem.answer_parts.append(cleaned)
+                turn_answer_parts.append(cleaned)
                 self._append_math_answer(cleaned)
                 self._update_math_card()
 
@@ -1452,7 +1463,12 @@ class FeishuCodexBridge:
                 problem.status = "completed"
                 problem.finished_at = datetime.now().isoformat(timespec="seconds")
                 self._append_math_status("本轮讲解完成。")
+            completed_answer = "".join(turn_answer_parts).strip()
+            if completed_answer and not interrupted:
+                problem.answer_parts.append(completed_answer)
             problem.updated_at = datetime.now().isoformat(timespec="seconds")
+            if not interrupted and problem.answer_parts:
+                self._sync_math_problem_to_doc(problem)
             self._flush_math_typewriter()
             self._update_math_card(force=True)
 
@@ -1647,15 +1663,22 @@ class FeishuCodexBridge:
             self.state.set_math_summary_doc(document_id, title)
         return document_id
 
-    def _ensure_math_summary_document(self) -> str:
-        return self.state.math_summary_doc_id
+    def _ensure_math_summary_document(self, problem: Optional[MathTutorProblem] = None) -> str:
+        document_id = self.state.math_summary_doc_id
+        if document_id:
+            return document_id
+        title = self.state.math_summary_doc_title or self.config.math_tutor_doc_title
+        document_id = self._create_math_summary_document(title)
+        if document_id and problem:
+            self._append_math_status(f"已固定数学总结文档：{document_id}")
+        return document_id
 
     def _sync_math_problem_to_doc(self, problem: MathTutorProblem) -> None:
         if problem.doc_synced:
             return
         if not problem.user_inputs and not problem.answer_parts:
             return
-        document_id = self._ensure_math_summary_document()
+        document_id = problem.doc_document_id or self._ensure_math_summary_document(problem)
         if not document_id:
             return
         markdown = self._build_math_summary_markdown(problem)
@@ -1665,7 +1688,33 @@ class FeishuCodexBridge:
             self._flush_math_typewriter()
             self._update_math_card(force=True)
             return
-        index = self._document_child_count(document_id)
+        if problem.doc_start_index >= 0 and problem.doc_block_count > 0:
+            ok, block_count = self._replace_math_problem_doc_blocks(
+                document_id=document_id,
+                start_index=problem.doc_start_index,
+                old_count=problem.doc_block_count,
+                blocks=blocks,
+            )
+            action = "更新"
+        else:
+            start_index = self._document_child_count(document_id)
+            ok, block_count = self._append_blocks_to_document(document_id, start_index, blocks)
+            if ok:
+                problem.doc_start_index = start_index
+            action = "同步"
+        if not ok:
+            self._append_math_status("同步飞书文档失败：写入文档接口报错。")
+            self._flush_math_typewriter()
+            self._update_math_card(force=True)
+            return
+        problem.doc_document_id = document_id
+        problem.doc_block_count = block_count
+        problem.doc_synced = True
+        self._append_math_status(f"本题已{action}到飞书文档：{document_id}")
+        self._flush_math_typewriter()
+        self._update_math_card(force=True)
+
+    def _append_blocks_to_document(self, document_id: str, index: int, blocks: list) -> tuple[bool, int]:
         req = (
             CreateDocumentBlockChildrenRequest.builder()
             .document_id(document_id)
@@ -1681,15 +1730,34 @@ class FeishuCodexBridge:
         )
         resp = self.api_client.docx.v1.document_block_children.create(req)
         if not resp.success():
-            self._append_math_status("同步飞书文档失败：写入文档接口报错。")
             self._log(f"[bridge] append math doc failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
-            self._flush_math_typewriter()
-            self._update_math_card(force=True)
-            return
-        problem.doc_synced = True
-        self._append_math_status(f"本题已同步到飞书文档：{document_id}")
-        self._flush_math_typewriter()
-        self._update_math_card(force=True)
+            return False, 0
+        created = list(resp.data.children or []) if resp.data else []
+        return True, len(created) or len(blocks)
+
+    def _replace_math_problem_doc_blocks(self, document_id: str, start_index: int, old_count: int, blocks: list) -> tuple[bool, int]:
+        if old_count > 0:
+            delete_req = (
+                BatchDeleteDocumentBlockChildrenRequest.builder()
+                .document_id(document_id)
+                .block_id(document_id)
+                .document_revision_id(-1)
+                .request_body(
+                    BatchDeleteDocumentBlockChildrenRequestBody.builder()
+                    .start_index(start_index)
+                    .end_index(start_index + old_count)
+                    .build()
+                )
+                .build()
+            )
+            delete_resp = self.api_client.docx.v1.document_block_children.batch_delete(delete_req)
+            if not delete_resp.success():
+                self._log(
+                    f"[bridge] replace math doc delete failed code={delete_resp.code} "
+                    f"msg={delete_resp.msg} log_id={delete_resp.get_log_id()}"
+                )
+                return False, old_count
+        return self._append_blocks_to_document(document_id, start_index, blocks)
 
     def _convert_markdown_to_blocks(self, markdown: str) -> list:
         req = (
@@ -1807,7 +1875,7 @@ class FeishuCodexBridge:
             "结束做题 - 退出数学辅导模式\n"
             "设置数学辅导提示词 <内容> - 更新数学辅导系统提示词\n"
             "查看数学辅导提示词 / 清空数学辅导提示词 - 查看或恢复默认提示词\n"
-            "创建数学总结文档 [标题] / 绑定数学总结文档 <doc_id> - 配置飞书文档总结（在下一题/结束做题时追加）\n"
+            "创建数学总结文档 [标题] / 绑定数学总结文档 <doc_id> - 配置固定飞书文档；未绑定时会在首次同步时自动创建\n"
             "查看数学总结文档 / 关闭数学总结文档 - 查看或关闭文档同步\n"
             "/history - 查看最近任务；/history <task_id> 查看详情；/history clear 清空历史\n"
             "/ctrlc - 给终端发送 Ctrl+C\n"
