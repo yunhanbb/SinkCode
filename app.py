@@ -49,6 +49,12 @@ ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 MENTION_TOKEN_RE = re.compile(r"@_[^\s]+")
 DOCX_CREATE_CHILDREN_BATCH_SIZE = 50
 DOCX_WRITE_INTERVAL_SECONDS = 0.4
+CARD_MARKDOWN_CHUNK_CHARS = 1800
+CARD_MAX_MARKDOWN_CHUNKS = 18
+CARD_MAX_COMMAND_BLOCKS = 6
+CARD_MAX_BODY_ELEMENTS = 120
+CARD_HEADER_TEXT_LIMIT = 80
+CARD_SUMMARY_TEXT_LIMIT = 60
 
 
 @dataclass
@@ -73,6 +79,9 @@ class Config:
     ca_cert_path: Optional[Path]
     insecure_skip_verify: bool
     card_template_id: str
+    general_card_template_id: str
+    codex_card_template_id: str
+    math_card_template_id: str
     card_template_var_name: str
     card_status_var_name: str
     card_answer_var_name: str
@@ -124,6 +133,9 @@ class Config:
             ca_cert_path=ca_cert_path,
             insecure_skip_verify=insecure_skip_verify,
             card_template_id=os.getenv("CARD_TEMPLATE_ID", "").strip(),
+            general_card_template_id=os.getenv("GENERAL_CARD_TEMPLATE_ID", "").strip(),
+            codex_card_template_id=os.getenv("CODEX_CARD_TEMPLATE_ID", "").strip(),
+            math_card_template_id=os.getenv("MATH_CARD_TEMPLATE_ID", "").strip(),
             card_template_var_name=os.getenv("CARD_TEMPLATE_VAR_NAME", "content").strip() or "content",
             card_status_var_name=os.getenv("CARD_STATUS_VAR_NAME", "status_content").strip(),
             card_answer_var_name=os.getenv("CARD_ANSWER_VAR_NAME", "answer_content").strip(),
@@ -1025,11 +1037,348 @@ class FeishuCodexBridge:
                 self._session_answer_parts = self._session_answer_parts[-300:]
         return True
 
+    @staticmethod
+    def _truncate_inline_text(text: str, limit: int) -> str:
+        compact = re.sub(r"\s+", " ", (text or "").strip())
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(1, limit - 3)] + "..."
+
+    @staticmethod
+    def _escape_card_literal(text: str) -> str:
+        escaped = (text or "").replace("&", "&amp;")
+        replacements = {
+            ">": "&#62;",
+            "<": "&#60;",
+            "~": "&sim;",
+            "-": "&#45;",
+            "!": "&#33;",
+            "*": "&#42;",
+            "/": "&#47;",
+            "\\": "&#92;",
+            "[": "&#91;",
+            "]": "&#93;",
+            "(": "&#40;",
+            ")": "&#41;",
+            "#": "&#35;",
+            ":": "&#58;",
+            "+": "&#43;",
+            '"': "&#34;",
+            "'": "&#39;",
+            "`": "&#96;",
+            "$": "&#36;",
+            "_": "&#95;",
+        }
+        for src, dst in replacements.items():
+            escaped = escaped.replace(src, dst)
+        return escaped
+
+    @staticmethod
+    def _markdown_element(content: str, text_size: str = "normal", margin: str = "0px") -> dict:
+        return {
+            "tag": "markdown",
+            "content": content or " ",
+            "text_size": text_size,
+            "margin": margin,
+        }
+
+    @classmethod
+    def _split_large_markdown_block(cls, block: str, max_chars: int) -> list[str]:
+        if len(block) <= max_chars:
+            return [block]
+
+        stripped = block.strip("\n")
+        if stripped.startswith("```") and stripped.endswith("```"):
+            lines = stripped.split("\n")
+            if len(lines) >= 2:
+                opening = lines[0]
+                closing = lines[-1]
+                body_lines = lines[1:-1] or [""]
+                chunks: list[str] = []
+                current: list[str] = []
+                overhead = len(opening) + len(closing) + 2
+                for line in body_lines:
+                    candidate = "\n".join(current + [line])
+                    if current and (len(candidate) + overhead) > max_chars:
+                        chunks.append(f"{opening}\n" + "\n".join(current) + f"\n{closing}")
+                        current = [line]
+                    else:
+                        current.append(line)
+                if current:
+                    chunks.append(f"{opening}\n" + "\n".join(current) + f"\n{closing}")
+                return chunks
+
+        chunks: list[str] = []
+        current = ""
+        for line in block.split("\n"):
+            candidate = line if not current else current + "\n" + line
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks or [block[:max_chars]]
+
+    @classmethod
+    def _split_markdown_for_card(
+        cls,
+        text: str,
+        max_chars: int = CARD_MARKDOWN_CHUNK_CHARS,
+        max_chunks: int = CARD_MAX_MARKDOWN_CHUNKS,
+    ) -> list[str]:
+        normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized:
+            return []
+
+        blocks: list[str] = []
+        current: list[str] = []
+        fence_open = False
+        for line in normalized.split("\n"):
+            stripped = line.lstrip()
+            if stripped.startswith("```"):
+                if not fence_open:
+                    if current:
+                        blocks.append("\n".join(current).strip("\n"))
+                        current = []
+                    current = [line]
+                    fence_open = True
+                else:
+                    current.append(line)
+                    blocks.append("\n".join(current).strip("\n"))
+                    current = []
+                    fence_open = False
+                continue
+            if fence_open:
+                current.append(line)
+                continue
+            if not line.strip():
+                if current:
+                    blocks.append("\n".join(current).strip("\n"))
+                    current = []
+                continue
+            current.append(line)
+        if current:
+            blocks.append("\n".join(current).strip("\n"))
+
+        chunks: list[str] = []
+        current_chunk = ""
+        for block in blocks:
+            if len(block) > max_chars:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                chunks.extend(cls._split_large_markdown_block(block, max_chars))
+                continue
+
+            candidate = block if not current_chunk else current_chunk + "\n\n" + block
+            if current_chunk and len(candidate) > max_chars:
+                chunks.append(current_chunk.strip())
+                current_chunk = block
+            else:
+                current_chunk = candidate
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        if len(chunks) > max_chunks:
+            kept = chunks[: max_chunks - 1]
+            kept.append("_内容过长，已折叠更早片段。_")
+            return kept
+        return chunks
+
+    @classmethod
+    def _wrap_code_fence(cls, text: str, language: str = "plain_text") -> str:
+        body = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        if not body:
+            body = " "
+        fence = "```"
+        while fence in body:
+            fence += "`"
+        return f"{fence}{language}\n{body}\n{fence}"
+
+    @staticmethod
+    def _status_theme(status: str) -> tuple[str, str]:
+        key = (status or "").strip().lower()
+        if key == "completed":
+            return "green", "green"
+        if key == "interrupted":
+            return "orange", "orange"
+        if key in {"failed", "error"}:
+            return "red", "red"
+        if key == "running":
+            return "blue", "blue"
+        return "grey", "neutral"
+
+    @staticmethod
+    def _header_tag(text: str, color: str) -> dict:
+        return {
+            "tag": "text_tag",
+            "text": {"tag": "plain_text", "content": text},
+            "color": color,
+        }
+
+    def _build_rich_card(
+        self,
+        *,
+        title: str,
+        subtitle: str,
+        template: str,
+        summary: str,
+        tags: list[dict],
+        elements: list[dict],
+    ) -> dict:
+        body_elements = elements[:CARD_MAX_BODY_ELEMENTS]
+        return {
+            "schema": "2.0",
+            "config": {
+                "enable_forward": True,
+                "update_multi": True,
+                "width_mode": "fill",
+                "summary": {"content": summary or "OpenCodex"},
+            },
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "subtitle": {"tag": "plain_text", "content": subtitle or " "},
+                "template": template,
+                "text_tag_list": tags[:3],
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "vertical_spacing": "8px",
+                "elements": body_elements or [self._markdown_element("_暂无内容_")],
+            },
+        }
+
+    def _build_session_card_json(self) -> dict:
+        task = self._active_task
+        status_md, answer_md = self._render_session_sections()
+        prompt = task.prompt if task else ""
+        status = task.status if task else "running"
+        template, tag_color = self._status_theme(status)
+        commands = task.commands if task else []
+        recent_commands = commands[-CARD_MAX_COMMAND_BLOCKS:]
+        elements = [
+            self._markdown_element("### Prompt", text_size="heading"),
+            self._markdown_element(self._wrap_code_fence(prompt, "plain_text")),
+            self._markdown_element("<hr>"),
+            self._markdown_element("### Activity", text_size="heading"),
+            self._markdown_element(status_md),
+        ]
+        if recent_commands:
+            dropped = max(0, len(commands) - len(recent_commands))
+            elements.extend(
+                [
+                    self._markdown_element("<hr>"),
+                    self._markdown_element("### Commands", text_size="heading"),
+                ]
+            )
+            if dropped > 0:
+                elements.append(self._markdown_element(f"_已折叠更早命令 {dropped} 条（可用 /history 查看完整）_"))
+            base_index = len(commands) - len(recent_commands) + 1
+            for idx, command in enumerate(recent_commands, start=base_index):
+                elements.append(self._markdown_element(f"**#{idx}**"))
+                elements.append(self._markdown_element(self._wrap_code_fence(self._format_status_command(command), "shell")))
+        elements.extend(
+            [
+                self._markdown_element("<hr>"),
+                self._markdown_element("### Response", text_size="heading"),
+            ]
+        )
+        answer_chunks = self._split_markdown_for_card(answer_md) or ["_等待回答中..._"]
+        elements.extend(self._markdown_element(chunk) for chunk in answer_chunks)
+        title = "Codex CLI"
+        subtitle = self._truncate_inline_text(prompt, CARD_HEADER_TEXT_LIMIT) or "等待请求"
+        summary = self._truncate_inline_text(answer_md if answer_md and answer_md != "_等待回答中..._" else prompt, CARD_SUMMARY_TEXT_LIMIT)
+        tags = [
+            self._header_tag("Codex", "blue"),
+            self._header_tag(status.upper(), tag_color),
+        ]
+        return self._build_rich_card(
+            title=title,
+            subtitle=subtitle,
+            template=template,
+            summary=summary or "Codex 会话",
+            tags=tags,
+            elements=elements,
+        )
+
+    def _build_math_card_json(self) -> dict:
+        problem = self._math_problem
+        status_md, answer_md = self._render_math_sections()
+        status = problem.status if problem else "running"
+        template, tag_color = self._status_theme(status)
+        title = "数学辅导"
+        subtitle = f"第 {problem.problem_index} 题" if problem else "数学辅导"
+        tags = [
+            self._header_tag("Math", "indigo"),
+            self._header_tag(status.upper(), tag_color),
+        ]
+        elements = [
+            self._markdown_element("### Activity", text_size="heading"),
+            self._markdown_element(status_md),
+            self._markdown_element("<hr>"),
+            self._markdown_element("### Explanation", text_size="heading"),
+        ]
+        answer_chunks = self._split_markdown_for_card(answer_md) or ["_等待讲解中..._"]
+        elements.extend(self._markdown_element(chunk) for chunk in answer_chunks)
+        summary = self._truncate_inline_text(answer_md if answer_md and answer_md != "_等待讲解中..._" else subtitle, CARD_SUMMARY_TEXT_LIMIT)
+        return self._build_rich_card(
+            title=title,
+            subtitle=subtitle,
+            template=template,
+            summary=summary or "数学辅导",
+            tags=tags,
+            elements=elements,
+        )
+
+    def _build_general_card_json(self) -> dict:
+        status_md, answer_md = self._render_general_sections()
+        if self.math_tutor_mode:
+            mode_text = "数学辅导中"
+            template = "indigo"
+            mode_color = "indigo"
+        elif self.codex_mode:
+            mode_text = "Codex 对话中"
+            template = "blue"
+            mode_color = "blue"
+        else:
+            mode_text = "普通终端模式"
+            template = "grey"
+            mode_color = "neutral"
+        elements = [
+            self._markdown_element("### System", text_size="heading"),
+            self._markdown_element(status_md),
+            self._markdown_element("<hr>"),
+            self._markdown_element("### Feed", text_size="heading"),
+        ]
+        answer_chunks = self._split_markdown_for_card(answer_md) or ["_暂无消息_"]
+        elements.extend(self._markdown_element(chunk) for chunk in answer_chunks)
+        summary = self._truncate_inline_text(answer_md, CARD_SUMMARY_TEXT_LIMIT) or "系统消息"
+        return self._build_rich_card(
+            title="OpenCodex",
+            subtitle=mode_text,
+            template=template,
+            summary=summary,
+            tags=[self._header_tag(mode_text, mode_color)],
+            elements=elements,
+        )
+
+    def _resolve_template_id(self, kind: str) -> str:
+        if kind == "general":
+            return self.config.general_card_template_id or self.config.card_template_id
+        if kind == "codex":
+            return self.config.codex_card_template_id or self.config.card_template_id
+        if kind == "math":
+            return self.config.math_card_template_id or self.config.card_template_id
+        return self.config.card_template_id
+
     def _render_session_sections(self) -> tuple[str, str]:
         status_source = self._session_status_parts[-max(1, self.config.card_status_max_lines):]
         status_lines = []
         for idx, item in enumerate(status_source, start=1):
-            safe_item = item.replace("`", "'")
+            safe_item = self._escape_card_literal(item)
             status_lines.append(f"{idx}. {safe_item}")
         dropped_status = max(0, len(self._session_status_parts) - len(status_source))
         if dropped_status > 0:
@@ -1040,17 +1389,34 @@ class FeishuCodexBridge:
         answer = "\n\n".join([p for p in self._session_answer_parts if p.strip()]).strip()
         if not answer:
             answer = "_等待回答中..._"
-        if len(answer) > self.config.card_answer_max_chars:
-            answer = (
-                "_已折叠更早回答内容（可用 /history 查看完整）_\n\n"
-                + answer[-self.config.card_answer_max_chars :]
-            )
 
         return "\n".join(status_lines), answer
 
     def _send_session_card(self, chat_id: str) -> str:
+        template_id = self._resolve_template_id("codex")
+        if template_id:
+            status_md, answer_md = self._render_session_sections()
+            msg_id = self._send_template_card(
+                chat_id,
+                template_id=template_id,
+                raw_text="",
+                status_text=status_md,
+                answer_text=answer_md,
+            )
+            if msg_id:
+                return msg_id
+        card = self._build_session_card_json()
+        msg_id = self._send_interactive_card(chat_id, card)
+        if msg_id:
+            return msg_id
         status_md, answer_md = self._render_session_sections()
-        return self._send_template_card(chat_id, raw_text="", status_text=status_md, answer_text=answer_md)
+        return self._send_template_card(
+            chat_id,
+            template_id=self.config.card_template_id,
+            raw_text="",
+            status_text=status_md,
+            answer_text=answer_md,
+        )
 
     def _update_task_card(self, force: bool = False) -> None:
         if not self._session_card_message_id:
@@ -1061,8 +1427,25 @@ class FeishuCodexBridge:
             return
         if not force and not progressed:
             return
-        status_md, answer_md = self._render_session_sections()
-        if self._patch_card_message(self._session_card_message_id, raw_text="", status_text=status_md, answer_text=answer_md):
+        template_id = self._resolve_template_id("codex")
+        if template_id:
+            status_md, answer_md = self._render_session_sections()
+            if self._patch_card_message(
+                self._session_card_message_id,
+                template_id=template_id,
+                raw_text="",
+                status_text=status_md,
+                answer_text=answer_md,
+            ):
+                if self._active_task:
+                    self._active_task.last_card_push_ts = now
+                    self.history.update_task(self._active_task.task_id, lambda d: d.__setitem__("updated_at", datetime.now().isoformat(timespec="seconds")))
+                    self._log(f"[bridge] card updated message_id={self._session_card_message_id} task_id={self._active_task.task_id}")
+                else:
+                    self._log(f"[bridge] card updated message_id={self._session_card_message_id}")
+                return
+        card = self._build_session_card_json()
+        if self._patch_interactive_card(self._session_card_message_id, card):
             if self._active_task:
                 self._active_task.last_card_push_ts = now
                 self.history.update_task(self._active_task.task_id, lambda d: d.__setitem__("updated_at", datetime.now().isoformat(timespec="seconds")))
@@ -1314,7 +1697,7 @@ class FeishuCodexBridge:
         status_source = self._math_status_parts[-max(1, self.config.card_status_max_lines):]
         status_lines = []
         for idx, item in enumerate(status_source, start=1):
-            safe_item = item.replace("`", "'")
+            safe_item = self._escape_card_literal(item)
             status_lines.append(f"{idx}. {safe_item}")
         dropped_status = max(0, len(self._math_status_parts) - len(status_source))
         if dropped_status > 0:
@@ -1322,7 +1705,13 @@ class FeishuCodexBridge:
         if not status_lines:
             status_lines.append("- 暂无状态")
 
-        answer = self._render_math_doc_link_markdown()
+        answer = "\n\n".join([p for p in self._math_answer_parts if p.strip()]).strip()
+        answer = self._normalize_math_markdown_for_card(answer)
+        if not answer:
+            answer = "_等待讲解中..._"
+        doc_link = self._render_math_doc_link_markdown()
+        if doc_link:
+            answer = answer + "\n\n<hr>\n\n" + doc_link if answer else doc_link
         return "\n".join(status_lines), answer
 
     def _render_math_doc_link_markdown(self) -> str:
@@ -1332,13 +1721,35 @@ class FeishuCodexBridge:
         elif self.state.math_summary_doc_id:
             document_id = self.state.math_summary_doc_id
         if not document_id:
-            return "_讲解同步到云文档后，这里会显示跳转链接。_"
+            return ""
         link = self._math_summary_doc_link(document_id)
         return f"[查看本题讲解云文档]({link})"
 
     def _send_math_card(self, chat_id: str) -> str:
+        template_id = self._resolve_template_id("math")
+        if template_id:
+            status_md, answer_md = self._render_math_sections()
+            msg_id = self._send_template_card(
+                chat_id,
+                template_id=template_id,
+                raw_text="",
+                status_text=status_md,
+                answer_text=answer_md,
+            )
+            if msg_id:
+                return msg_id
+        card = self._build_math_card_json()
+        msg_id = self._send_interactive_card(chat_id, card)
+        if msg_id:
+            return msg_id
         status_md, answer_md = self._render_math_sections()
-        return self._send_template_card(chat_id, raw_text="", status_text=status_md, answer_text=answer_md)
+        return self._send_template_card(
+            chat_id,
+            template_id=self.config.card_template_id,
+            raw_text="",
+            status_text=status_md,
+            answer_text=answer_md,
+        )
 
     def _update_math_card(self, force: bool = False) -> None:
         problem = self._math_problem
@@ -1350,8 +1761,20 @@ class FeishuCodexBridge:
             return
         if not force and not progressed:
             return
-        status_md, answer_md = self._render_math_sections()
-        if self._patch_card_message(problem.card_message_id, raw_text="", status_text=status_md, answer_text=answer_md):
+        template_id = self._resolve_template_id("math")
+        if template_id:
+            status_md, answer_md = self._render_math_sections()
+            if self._patch_card_message(
+                problem.card_message_id,
+                template_id=template_id,
+                raw_text="",
+                status_text=status_md,
+                answer_text=answer_md,
+            ):
+                problem.last_card_push_ts = now
+                return
+        card = self._build_math_card_json()
+        if self._patch_interactive_card(problem.card_message_id, card):
             problem.last_card_push_ts = now
             return
         self._log(f"[bridge] math card update failed problem_id={problem.problem_id} message_id={problem.card_message_id}")
@@ -2031,23 +2454,41 @@ class FeishuCodexBridge:
             self._log(f"[bridge] send exception chat_id={chat_id} err={exc}")
 
     def _upsert_general_card(self, chat_id: str, text: str, force_new: bool = False) -> bool:
-        if not text.strip() or not self.config.card_template_id:
+        if not text.strip():
             return False
         if force_new:
             self._reset_general_card_state()
         self._general_feed_parts.append(text)
         if len(self._general_feed_parts) > 120:
             self._general_feed_parts = self._general_feed_parts[-120:]
-        status_md, answer_md = self._render_general_sections()
-        if self._general_card_message_id and self._patch_card_message(
-            self._general_card_message_id,
-            raw_text="",
-            status_text=status_md,
-            answer_text=answer_md,
-        ):
+        template_id = self._resolve_template_id("general")
+        if template_id:
+            status_md, answer_md = self._render_general_sections()
+            if self._general_card_message_id and self._patch_card_message(
+                self._general_card_message_id,
+                template_id=template_id,
+                raw_text=text,
+                status_text=status_md,
+                answer_text=answer_md,
+            ):
+                self._log(f"[bridge] general card updated message_id={self._general_card_message_id}")
+                return True
+            msg_id = self._send_template_card(
+                chat_id,
+                template_id=template_id,
+                raw_text=text,
+                status_text=status_md,
+                answer_text=answer_md,
+            )
+            if msg_id:
+                self._general_card_message_id = msg_id
+                return True
+
+        card = self._build_general_card_json()
+        if self._general_card_message_id and self._patch_interactive_card(self._general_card_message_id, card):
             self._log(f"[bridge] general card updated message_id={self._general_card_message_id}")
             return True
-        msg_id = self._send_template_card(chat_id, raw_text=text, status_text=status_md, answer_text=answer_md)
+        msg_id = self._send_interactive_card(chat_id, card)
         if not msg_id:
             return False
         self._general_card_message_id = msg_id
@@ -2065,14 +2506,9 @@ class FeishuCodexBridge:
         status_lines = [f"系统消息面板", f"当前模式: {mode_text}"]
         if dropped > 0:
             status_lines.append(f"_已折叠更早消息 {dropped} 条_")
-        answer = "\n\n---\n\n".join(item.strip() for item in items if item.strip()).strip()
+        answer = "\n\n<hr>\n\n".join(self._escape_card_literal(item.strip()) for item in items if item.strip()).strip()
         if not answer:
             answer = "_暂无消息_"
-        if len(answer) > self.config.card_answer_max_chars:
-            answer = (
-                "_已折叠更早系统消息内容_\n\n"
-                + answer[-self.config.card_answer_max_chars :]
-            )
         return "\n".join(status_lines), answer
 
     def _send_text_standalone(self, chat_id: str, text: str) -> None:
@@ -2101,16 +2537,50 @@ class FeishuCodexBridge:
         self._log(f"[bridge] send ok(text) chat_id={chat_id} size={len(text)}")
 
     def _send_markdown(self, chat_id: str, text: str) -> bool:
-        msg_id = self._send_template_card(
-            chat_id,
-            raw_text=text,
-            status_text="系统消息",
-            answer_text=text,
+        template_id = self._resolve_template_id("general")
+        if template_id:
+            msg_id = self._send_template_card(
+                chat_id,
+                template_id=template_id,
+                raw_text=text,
+                status_text="系统消息",
+                answer_text=text,
+            )
+            if msg_id:
+                return True
+        card = self._build_rich_card(
+            title="OpenCodex",
+            subtitle="系统消息",
+            template="grey",
+            summary=self._truncate_inline_text(text, CARD_SUMMARY_TEXT_LIMIT) or "系统消息",
+            tags=[self._header_tag("System", "neutral")],
+            elements=[self._markdown_element(chunk) for chunk in self._split_markdown_for_card(text) or ["_暂无消息_"]],
         )
+        msg_id = self._send_interactive_card(chat_id, card)
+        if not msg_id:
+            msg_id = self._send_template_card(
+                chat_id,
+                template_id=self.config.card_template_id,
+                raw_text=text,
+                status_text="系统消息",
+                answer_text=text,
+            )
         return bool(msg_id)
 
-    def _patch_card_message(self, message_id: str, raw_text: str, status_text: str = "", answer_text: str = "") -> bool:
-        content = self._template_card_content(raw_text=raw_text, status_text=status_text, answer_text=answer_text)
+    def _patch_card_message(
+        self,
+        message_id: str,
+        template_id: str,
+        raw_text: str,
+        status_text: str = "",
+        answer_text: str = "",
+    ) -> bool:
+        content = self._template_card_content(
+            template_id=template_id,
+            raw_text=raw_text,
+            status_text=status_text,
+            answer_text=answer_text,
+        )
         req = (
             PatchMessageRequest.builder()
             .message_id(message_id)
@@ -2129,7 +2599,32 @@ class FeishuCodexBridge:
         )
         return False
 
-    def _template_card_content(self, raw_text: str, status_text: str = "", answer_text: str = "") -> dict:
+    def _patch_interactive_card(self, message_id: str, card_content: dict) -> bool:
+        req = (
+            PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .content(json.dumps(card_content, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.patch(req)
+        if resp.success():
+            return True
+        self._log(
+            f"[bridge] patch interactive card failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()} message_id={message_id}"
+        )
+        return False
+
+    def _template_card_content(
+        self,
+        template_id: str,
+        raw_text: str,
+        status_text: str = "",
+        answer_text: str = "",
+    ) -> dict:
         safe_raw = raw_text if raw_text.strip() else " "
         safe_status = status_text if status_text.strip() else " "
         safe_answer = answer_text if answer_text.strip() else " "
@@ -2142,7 +2637,7 @@ class FeishuCodexBridge:
         return {
             "type": "template",
             "data": {
-                "template_id": self.config.card_template_id,
+                "template_id": template_id,
                 "template_variable": variables,
             },
         }
@@ -2150,16 +2645,22 @@ class FeishuCodexBridge:
     def _send_template_card(
         self,
         chat_id: str,
+        template_id: str,
         raw_text: str,
         status_text: str = "",
         answer_text: str = "",
     ) -> str:
         safe_text = raw_text if raw_text.strip() else " "
-        if not self.config.card_template_id:
+        if not template_id:
             self._log("[bridge] schema2 template card skipped: CARD_TEMPLATE_ID is empty")
             return ""
 
-        card = self._template_card_content(raw_text=safe_text, status_text=status_text, answer_text=answer_text)
+        card = self._template_card_content(
+            template_id=template_id,
+            raw_text=safe_text,
+            status_text=status_text,
+            answer_text=answer_text,
+        )
         req = (
             CreateMessageRequest.builder()
             .receive_id_type("chat_id")
@@ -2183,6 +2684,33 @@ class FeishuCodexBridge:
             return msg_id or ""
         self._log(
             f"[bridge] send schema2-template-card failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+        )
+        return ""
+
+    def _send_interactive_card(self, chat_id: str, card_content: dict) -> str:
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(json.dumps(card_content, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.create(req)
+        if resp.success():
+            msg_type = getattr(resp.data, "msg_type", None) if resp.data else None
+            msg_id = getattr(resp.data, "message_id", None) if resp.data else None
+            self._log(
+                f"[bridge] send ok(interactive-card-v2) chat_id={chat_id}"
+                f" msg_type={msg_type} message_id={msg_id}"
+            )
+            return msg_id or ""
+        self._log(
+            f"[bridge] send interactive card failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
         )
         return ""
 
