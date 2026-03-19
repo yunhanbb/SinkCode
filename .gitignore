@@ -1,0 +1,31 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files (keep examples)
+.env
+.env.*
+!.env.example
+
+# Runtime state/logs
+.bridge_state.json
+bridge.log
+*.log
+history/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE/OS
+.DS_Store
+.idea/
+.vscode/

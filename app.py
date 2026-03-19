@@ -1,0 +1,1098 @@
+import json
+import os
+import queue
+import re
+import shlex
+import signal
+import ssl
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from uuid import uuid4
+
+import lark_oapi as lark
+import pexpect
+from dotenv import load_dotenv
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest,
+    CreateMessageRequestBody,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
+)
+from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
+
+
+ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+MENTION_TOKEN_RE = re.compile(r"@_[^\s]+")
+
+
+@dataclass
+class Config:
+    app_id: str
+    app_secret: str
+    verification_token: str
+    encrypt_key: str
+    shell_path: str
+    state_file: Path
+    log_file: Path
+    history_dir: Path
+    flush_interval_seconds: float
+    codex_flush_interval_seconds: float
+    card_update_interval_seconds: float
+    card_status_max_lines: int
+    card_answer_max_chars: int
+    max_message_chars: int
+    allowed_prefixes: tuple[str, ...]
+    ca_cert_path: Optional[Path]
+    insecure_skip_verify: bool
+    card_template_id: str
+    card_template_var_name: str
+    card_status_var_name: str
+    card_answer_var_name: str
+
+    @staticmethod
+    def load() -> "Config":
+        load_dotenv()
+        app_id = os.getenv("FEISHU_APP_ID", "").strip()
+        app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
+        verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip()
+        if not app_id or not app_secret or not verification_token:
+            raise ValueError("Missing FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_VERIFICATION_TOKEN")
+
+        prefixes = tuple(
+            p.strip()
+            for p in os.getenv("ALLOWED_COMMAND_PREFIXES", "").split(",")
+            if p.strip()
+        )
+        ca_cert_raw = os.getenv("FEISHU_CA_CERT_PATH", "").strip()
+        ca_cert_path = Path(ca_cert_raw).expanduser() if ca_cert_raw else None
+        insecure_skip_verify = os.getenv("FEISHU_INSECURE_SKIP_VERIFY", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        return Config(
+            app_id=app_id,
+            app_secret=app_secret,
+            verification_token=verification_token,
+            encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY", "").strip(),
+            shell_path=os.getenv("SHELL_PATH", "/bin/zsh").strip(),
+            state_file=Path(os.getenv("STATE_FILE", ".bridge_state.json")).expanduser(),
+            log_file=Path(os.getenv("LOG_FILE", "bridge.log")).expanduser(),
+            history_dir=Path(os.getenv("HISTORY_DIR", "history")).expanduser(),
+            flush_interval_seconds=float(os.getenv("FLUSH_INTERVAL_SECONDS", "1.2")),
+            codex_flush_interval_seconds=float(os.getenv("CODEX_FLUSH_INTERVAL_SECONDS", "0.35")),
+            card_update_interval_seconds=float(os.getenv("CARD_UPDATE_INTERVAL_SECONDS", "0.8")),
+            card_status_max_lines=int(os.getenv("CARD_STATUS_MAX_LINES", "18")),
+            card_answer_max_chars=int(os.getenv("CARD_ANSWER_MAX_CHARS", "2600")),
+            max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "1200")),
+            allowed_prefixes=prefixes,
+            ca_cert_path=ca_cert_path,
+            insecure_skip_verify=insecure_skip_verify,
+            card_template_id=os.getenv("CARD_TEMPLATE_ID", "").strip(),
+            card_template_var_name=os.getenv("CARD_TEMPLATE_VAR_NAME", "content").strip() or "content",
+            card_status_var_name=os.getenv("CARD_STATUS_VAR_NAME", "status_content").strip(),
+            card_answer_var_name=os.getenv("CARD_ANSWER_VAR_NAME", "answer_content").strip(),
+        )
+
+
+class BridgeState:
+    def __init__(self, state_file: Path):
+        self.state_file = state_file
+        self.authorized_open_id: Optional[str] = None
+        self.bound_chat_id: Optional[str] = None
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self) -> None:
+        if not self.state_file.exists():
+            return
+        try:
+            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+            self.authorized_open_id = raw.get("authorized_open_id")
+            self.bound_chat_id = raw.get("bound_chat_id")
+        except Exception:
+            pass
+
+    def bind(self, open_id: str, chat_id: str) -> None:
+        with self._lock:
+            self.authorized_open_id = open_id
+            self.bound_chat_id = chat_id
+            payload = {
+                "authorized_open_id": self.authorized_open_id,
+                "bound_chat_id": self.bound_chat_id,
+            }
+            self.state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def is_authorized(self, open_id: Optional[str]) -> bool:
+        if not self.authorized_open_id:
+            return True
+        return bool(open_id) and open_id == self.authorized_open_id
+
+
+@dataclass
+class CodexTask:
+    task_id: str
+    chat_id: str
+    sender_open_id: str
+    prompt: str
+    status: str
+    started_at: str
+    updated_at: str
+    finished_at: str
+    commands: list[str]
+    answer_parts: list[str]
+    events: list[str]
+    card_message_id: str
+    last_card_push_ts: float
+
+
+class HistoryStore:
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.tasks_dir = base_dir / "tasks"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def create_task(self, chat_id: str, sender_open_id: str, prompt: str) -> str:
+        task_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
+        now = self._now()
+        payload = {
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "sender_open_id": sender_open_id,
+            "prompt": prompt,
+            "status": "running",
+            "started_at": now,
+            "updated_at": now,
+            "finished_at": "",
+            "commands": [],
+            "answer_parts": [],
+            "events": [],
+            "card_message_id": "",
+        }
+        self._save(task_id, payload)
+        return task_id
+
+    def update_task(self, task_id: str, mutator) -> None:
+        with self._lock:
+            data = self._load(task_id)
+            if not data:
+                return
+            mutator(data)
+            data["updated_at"] = self._now()
+            self._save(task_id, data, locked=True)
+
+    def list_recent(self, limit: int = 10) -> list[dict]:
+        files = sorted(self.tasks_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        out = []
+        for fp in files[:max(1, limit)]:
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                out.append(
+                    {
+                        "task_id": data.get("task_id", ""),
+                        "status": data.get("status", ""),
+                        "started_at": data.get("started_at", ""),
+                        "prompt": str(data.get("prompt", "")),
+                    }
+                )
+            except Exception:
+                continue
+        return out
+
+    def get_task(self, task_id: str) -> Optional[dict]:
+        return self._load(task_id)
+
+    def clear(self) -> int:
+        count = 0
+        for fp in self.tasks_dir.glob("*.json"):
+            try:
+                fp.unlink()
+                count += 1
+            except Exception:
+                pass
+        return count
+
+    def _task_path(self, task_id: str) -> Path:
+        return self.tasks_dir / f"{task_id}.json"
+
+    def _load(self, task_id: str) -> Optional[dict]:
+        path = self._task_path(task_id)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _save(self, task_id: str, data: dict, locked: bool = False) -> None:
+        def _write():
+            self._task_path(task_id).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        if locked:
+            _write()
+        else:
+            with self._lock:
+                _write()
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+
+class ShellSession:
+    def __init__(self, shell_path: str):
+        self.shell_path = shell_path
+        self.output_queue: "queue.Queue[str]" = queue.Queue()
+        self.proc: Optional[pexpect.spawn] = None
+        self._stop = threading.Event()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._write_lock = threading.Lock()
+
+    def start(self) -> None:
+        self.proc = pexpect.spawn(self.shell_path, ["-li"], encoding="utf-8", echo=False, codec_errors="ignore")
+        self.proc.delaybeforesend = 0.02
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        assert self.proc is not None
+        while not self._stop.is_set():
+            try:
+                chunk = self.proc.read_nonblocking(size=4096, timeout=0.2)
+                if chunk:
+                    self.output_queue.put(chunk)
+            except pexpect.TIMEOUT:
+                continue
+            except pexpect.EOF:
+                self.output_queue.put("\n[bridge] shell session ended.\n")
+                break
+            except Exception as exc:
+                self.output_queue.put(f"\n[bridge] shell read error: {exc}\n")
+                break
+
+    def send_command(self, command: str) -> None:
+        if not self.proc:
+            raise RuntimeError("shell not started")
+        with self._write_lock:
+            self.proc.sendline(command)
+
+    def send_ctrl_c(self) -> None:
+        if not self.proc:
+            return
+        with self._write_lock:
+            self.proc.sendintr()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.proc and self.proc.isalive():
+            try:
+                self.proc.sendline("exit")
+            except Exception:
+                pass
+
+
+class FeishuCodexBridge:
+    def __init__(self, config: Config):
+        self.config = config
+        self._log_lock = threading.Lock()
+        self._log_file = config.log_file
+        self._log_file.parent.mkdir(parents=True, exist_ok=True)
+        self._log(f"[bridge] logfile: {self._log_file}")
+        self.state = BridgeState(config.state_file)
+        self.history = HistoryStore(config.history_dir)
+        self.shell = ShellSession(config.shell_path)
+        self.shutdown = threading.Event()
+        self._apply_tls_config()
+
+        self.api_client = (
+            lark.Client.builder()
+            .app_id(config.app_id)
+            .app_secret(config.app_secret)
+            .log_level(lark.LogLevel.INFO)
+            .build()
+        )
+
+        self.event_handler = (
+            lark.EventDispatcherHandler.builder(config.encrypt_key, config.verification_token)
+            .register_p2_im_message_receive_v1(self._on_receive_message)
+            .build()
+        )
+
+        self.ws_client = lark.ws.Client(
+            config.app_id,
+            config.app_secret,
+            log_level=lark.LogLevel.INFO,
+            event_handler=self.event_handler,
+        )
+
+        self.forwarder_thread = threading.Thread(target=self._forward_terminal_output, daemon=True)
+        self.codex_mode = False
+        self._mobile_line_carry = ""
+        self._active_task: Optional[CodexTask] = None
+        self._session_card_message_id = ""
+        self._session_status_parts: list[str] = []
+        self._session_answer_parts: list[str] = []
+
+    def _apply_tls_config(self) -> None:
+        ssl_context: Optional[ssl.SSLContext] = None
+
+        if self.config.ca_cert_path:
+            if not self.config.ca_cert_path.exists():
+                raise ValueError(f"FEISHU_CA_CERT_PATH does not exist: {self.config.ca_cert_path}")
+            ca_file = str(self.config.ca_cert_path)
+            os.environ["SSL_CERT_FILE"] = ca_file
+            os.environ["REQUESTS_CA_BUNDLE"] = ca_file
+            os.environ["CURL_CA_BUNDLE"] = ca_file
+            ssl_context = ssl.create_default_context(cafile=ca_file)
+            self._log(f"[bridge] TLS CA loaded: {ca_file}")
+
+        if self.config.insecure_skip_verify:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            self._patch_requests_insecure()
+            self._log("[bridge] WARNING: TLS verification disabled (FEISHU_INSECURE_SKIP_VERIFY=true)")
+
+        if ssl_context is not None:
+            self._patch_lark_ws_ssl(ssl_context)
+
+    @staticmethod
+    def _patch_lark_ws_ssl(ssl_context: ssl.SSLContext) -> None:
+        import lark_oapi.ws.client as ws_client
+
+        original_connect = ws_client.websockets.connect
+        if getattr(original_connect, "_bridge_tls_patched", False):
+            return
+
+        def wrapped_connect(uri, *args, **kwargs):
+            kwargs.setdefault("ssl", ssl_context)
+            return original_connect(uri, *args, **kwargs)
+
+        wrapped_connect._bridge_tls_patched = True
+        ws_client.websockets.connect = wrapped_connect
+
+    @staticmethod
+    def _patch_requests_insecure() -> None:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        original_request = requests.sessions.Session.request
+        if getattr(original_request, "_bridge_tls_patched", False):
+            return
+
+        def wrapped_request(session, method, url, **kwargs):
+            kwargs.setdefault("verify", False)
+            return original_request(session, method, url, **kwargs)
+
+        wrapped_request._bridge_tls_patched = True
+        requests.sessions.Session.request = wrapped_request
+
+    def start(self) -> None:
+        self.shell.start()
+        self.forwarder_thread.start()
+        self._send_bound_chat("[bridge] 已启动。发送 /help 查看命令。")
+        self.ws_client.start()
+
+    def stop(self) -> None:
+        self.shutdown.set()
+        self.shell.stop()
+
+    def _on_receive_message(self, data: P2ImMessageReceiveV1) -> None:
+        event = data.event
+        if not event or not event.message or not event.sender:
+            return
+
+        if event.sender.sender_type != "user":
+            return
+
+        sender_open_id = None
+        if event.sender.sender_id:
+            sender_open_id = event.sender.sender_id.open_id
+
+        chat_id = event.message.chat_id or ""
+        text = self._extract_text(event.message.message_type, event.message.content)
+        normalized_text = self._normalize_incoming_text(text)
+        self._log(
+            "[bridge] incoming: "
+            f"chat_id={chat_id} "
+            f"sender_open_id={sender_open_id} "
+            f"type={event.message.message_type} "
+            f"text={text!r} "
+            f"normalized={normalized_text!r}"
+        )
+        if not normalized_text:
+            return
+
+        if normalized_text.startswith("/bind"):
+            if not sender_open_id or not chat_id:
+                return
+            self.state.bind(sender_open_id, chat_id)
+            self._send_text(chat_id, "绑定成功。后续终端输出会推送到此会话。")
+            return
+
+        if not self.state.is_authorized(sender_open_id):
+            self._send_text(chat_id, "你没有权限。请先使用绑定账号发送 /bind。")
+            return
+
+        if normalized_text.startswith("/help"):
+            self._send_text(chat_id, self._help_text())
+            return
+
+        if normalized_text.startswith("/status"):
+            bound = self.state.bound_chat_id or "(未绑定)"
+            active_task = self._active_task.task_id if self._active_task else "(无)"
+            card_id = self._session_card_message_id or "(无)"
+            self._send_text(
+                chat_id,
+                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nactive_task: {active_task}\nsession_card: {card_id}",
+            )
+            return
+
+        if normalized_text.startswith("/ps"):
+            bound = self.state.bound_chat_id or "(未绑定)"
+            active_task = self._active_task.task_id if self._active_task else "(无)"
+            card_id = self._session_card_message_id or "(无)"
+            self._send_text(
+                chat_id,
+                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nactive_task: {active_task}\nsession_card: {card_id}",
+            )
+            return
+
+        if normalized_text.startswith("/history"):
+            self._handle_history_command(chat_id, normalized_text)
+            return
+
+        if normalized_text.startswith("/ctrlc"):
+            self.shell.send_ctrl_c()
+            if self._active_task:
+                self._active_task.status = "interrupted"
+                self._append_status("本轮请求被 Ctrl+C 中断。")
+                self.history.update_task(
+                    self._active_task.task_id,
+                    lambda d: (d.__setitem__("status", "interrupted"), d.__setitem__("finished_at", datetime.now().isoformat(timespec="seconds"))),
+                )
+                self._update_task_card(force=True)
+            self._mobile_line_carry = ""
+            if self.codex_mode and self._session_card_message_id:
+                self._append_status("已发送 Ctrl+C。")
+                self._update_task_card(force=True)
+            else:
+                self._send_text(chat_id, "已发送 Ctrl+C")
+            return
+
+        if normalized_text.startswith("/codex"):
+            if not self._command_allowed("codex exec"):
+                self._send_text(chat_id, "命令被策略拒绝。")
+                return
+            self.codex_mode = True
+            if not self._session_card_message_id:
+                self._append_status("会话已开启，等待请求。")
+                self._append_answer("_等待回答中..._")
+                self._session_card_message_id = self._send_session_card(chat_id)
+            self._append_status("已进入 Codex 对话模式（同一张卡片持续更新）。")
+            self._update_task_card(force=True)
+            return
+
+        if normalized_text.startswith("/exitcodex"):
+            if self._active_task:
+                self._active_task.status = "interrupted"
+                self._append_status("会话退出前中断当前请求。")
+                self.history.update_task(
+                    self._active_task.task_id,
+                    lambda d: (d.__setitem__("status", "interrupted"), d.__setitem__("finished_at", datetime.now().isoformat(timespec="seconds"))),
+                )
+                self._update_task_card(force=True)
+            self.codex_mode = False
+            self._mobile_line_carry = ""
+            self._active_task = None
+            self._append_status("会话已退出。")
+            self._update_task_card(force=True)
+            self._session_card_message_id = ""
+            self._session_status_parts = []
+            self._session_answer_parts = []
+            self.shell.send_ctrl_c()
+            self._send_text(chat_id, "已退出 Codex 终端模式。")
+            return
+
+        if normalized_text.startswith("/cmd"):
+            command = normalized_text[len("/cmd"):].strip()
+            if not command:
+                self._send_text(chat_id, "用法: /cmd <shell command>")
+                return
+            if not self._command_allowed(command):
+                self._send_text(chat_id, "命令被策略拒绝。")
+                return
+            self._log(f"[bridge] exec -> shell: {command}")
+            self.shell.send_command(command)
+            self._send_text(chat_id, f"$ {command}")
+            return
+
+        if self.codex_mode and not normalized_text.startswith("/"):
+            if self._active_task and self._active_task.status == "running":
+                self._append_status("上一条请求仍在执行，请稍后或发送 /ctrlc。")
+                self._update_task_card(force=True)
+                return
+            task = self._create_task(chat_id, sender_open_id or "", normalized_text)
+            self._active_task = task
+            if not self._session_card_message_id:
+                self._session_card_message_id = self._send_session_card(chat_id)
+            task.card_message_id = self._session_card_message_id
+            self.history.update_task(task.task_id, lambda d, cid=self._session_card_message_id: d.__setitem__("card_message_id", cid))
+            self._append_status(f"新请求：{normalized_text}")
+            self._append_status("请求已接收，正在执行。")
+            self._update_task_card(force=True)
+            prompt = shlex.quote(normalized_text)
+            self._log(f"[bridge] exec -> shell: codex exec --json --color never --skip-git-repo-check {prompt}")
+            self.shell.send_command(
+                f"codex exec --json --color never --skip-git-repo-check {prompt}"
+            )
+            return
+
+        if normalized_text.startswith("/"):
+            self._send_text(chat_id, "未知命令。发送 /help 查看可用命令。")
+
+    def _forward_terminal_output(self) -> None:
+        buffer = ""
+        last_flush = time.monotonic()
+
+        while not self.shutdown.is_set():
+            try:
+                chunk = self.shell.output_queue.get(timeout=0.2)
+                buffer += chunk
+            except queue.Empty:
+                pass
+
+            now = time.monotonic()
+            flush_interval = self.config.codex_flush_interval_seconds if self.codex_mode else self.config.flush_interval_seconds
+            due = (now - last_flush) >= flush_interval
+            if due and buffer:
+                cleaned = self._clean_output(buffer)
+                buffer = ""
+                last_flush = now
+                if cleaned.strip():
+                    self._log_shell_output(cleaned)
+                    if self.codex_mode:
+                        self._process_codex_chunk(cleaned)
+                    else:
+                        mobile_text = self._format_for_mobile(cleaned)
+                        if mobile_text.strip():
+                            self._send_bound_chat(mobile_text)
+
+        if buffer.strip():
+            cleaned = self._clean_output(buffer)
+            self._log_shell_output(cleaned)
+            if self.codex_mode:
+                self._process_codex_chunk(cleaned, flush_tail=True)
+            else:
+                mobile_text = self._format_for_mobile(cleaned, flush_tail=True)
+                if mobile_text.strip():
+                    self._send_bound_chat(mobile_text)
+
+    def _clean_output(self, text: str) -> str:
+        cleaned = ANSI_RE.sub("", text)
+        cleaned = cleaned.replace("\r", "\n")
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned
+
+    def _log_shell_output(self, text: str) -> None:
+        if not text.strip():
+            return
+        self._log("[bridge] shell output >>>")
+        self._log(text.rstrip("\n"))
+        self._log("[bridge] <<< shell output")
+
+    def _format_for_mobile(self, text: str, flush_tail: bool = False) -> str:
+        if not self.codex_mode:
+            return text
+
+        data = self._mobile_line_carry + text
+        lines = data.split("\n")
+        if data.endswith("\n") or flush_tail:
+            self._mobile_line_carry = ""
+        else:
+            self._mobile_line_carry = lines.pop()
+
+        out: list[str] = []
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+
+            formatted_json = self._format_codex_json_line(line)
+            if formatted_json is not None:
+                if formatted_json:
+                    out.append(formatted_json)
+                continue
+
+            if line == "codex":
+                continue
+            if line.startswith("(base) ") or line.startswith("% "):
+                continue
+            if line.startswith("Error:"):
+                out.append(f"[错误] {line[6:].strip()}")
+            else:
+                out.append(line)
+
+        return "\n".join(out).strip()
+
+    def _format_codex_json_line(self, line: str) -> Optional[str]:
+        if not (line.startswith("{") and line.endswith("}")):
+            return None
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None
+
+        event_type = str(obj.get("type") or obj.get("event") or obj.get("kind") or "").strip()
+        item = obj.get("item")
+        item_type = ""
+        command = ""
+        if isinstance(item, dict):
+            item_type = str(item.get("type") or "").strip()
+            command = self._to_short_text(item.get("command"))
+
+        if event_type == "item.started" and item_type == "command_execution":
+            if command:
+                return f"[命令执行中] {command}"
+            return "[命令执行中]"
+
+        if event_type == "item.completed" and item_type == "command_execution":
+            if command:
+                return f"[执行命令] {command}"
+            return ""
+
+        if event_type == "item.completed" and item_type == "agent_message":
+            return self._to_short_text(item.get("text")) if isinstance(item, dict) else ""
+
+        return ""
+
+    @staticmethod
+    def _to_short_text(value: object) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return ""
+
+    def _create_task(self, chat_id: str, sender_open_id: str, prompt: str) -> CodexTask:
+        task_id = self.history.create_task(chat_id, sender_open_id, prompt)
+        now = datetime.now().isoformat(timespec="seconds")
+        task = CodexTask(
+            task_id=task_id,
+            chat_id=chat_id,
+            sender_open_id=sender_open_id,
+            prompt=prompt,
+            status="running",
+            started_at=now,
+            updated_at=now,
+            finished_at="",
+            commands=[],
+            answer_parts=[],
+            events=[],
+            card_message_id="",
+            last_card_push_ts=0.0,
+        )
+        self._log(f"[bridge] task created: {task.task_id} prompt={prompt!r}")
+        return task
+
+    def _append_status(self, text: str) -> None:
+        self._session_status_parts.append(text)
+        if len(self._session_status_parts) > 500:
+            self._session_status_parts = self._session_status_parts[-500:]
+
+    def _append_answer(self, text: str) -> None:
+        self._session_answer_parts.append(text)
+        if len(self._session_answer_parts) > 300:
+            self._session_answer_parts = self._session_answer_parts[-300:]
+
+    def _render_session_sections(self) -> tuple[str, str]:
+        status_source = self._session_status_parts[-max(1, self.config.card_status_max_lines):]
+        status_lines = []
+        for idx, item in enumerate(status_source, start=1):
+            safe_item = item.replace("`", "'")
+            status_lines.append(f"{idx}. {safe_item}")
+        dropped_status = max(0, len(self._session_status_parts) - len(status_source))
+        if dropped_status > 0:
+            status_lines.insert(0, f"_已折叠更早状态 {dropped_status} 条（可用 /history 查看完整）_")
+        if not status_lines:
+            status_lines.append("- 暂无状态")
+
+        answer = "\n\n".join([p for p in self._session_answer_parts if p.strip()]).strip()
+        if not answer:
+            answer = "_等待回答中..._"
+        if len(answer) > self.config.card_answer_max_chars:
+            answer = (
+                "_已折叠更早回答内容（可用 /history 查看完整）_\n\n"
+                + answer[-self.config.card_answer_max_chars :]
+            )
+
+        return "\n".join(status_lines), answer
+
+    def _send_session_card(self, chat_id: str) -> str:
+        status_md, answer_md = self._render_session_sections()
+        return self._send_template_card(chat_id, raw_text="", status_text=status_md, answer_text=answer_md)
+
+    def _update_task_card(self, force: bool = False) -> None:
+        if not self._session_card_message_id:
+            return
+        now = time.monotonic()
+        if self._active_task and not force and (now - self._active_task.last_card_push_ts) < self.config.card_update_interval_seconds:
+            return
+        status_md, answer_md = self._render_session_sections()
+        content = self._template_card_content(raw_text="", status_text=status_md, answer_text=answer_md)
+        req = (
+            PatchMessageRequest.builder()
+            .message_id(self._session_card_message_id)
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .content(json.dumps(content, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.patch(req)
+        if resp.success():
+            if self._active_task:
+                self._active_task.last_card_push_ts = now
+                self.history.update_task(self._active_task.task_id, lambda d: d.__setitem__("updated_at", datetime.now().isoformat(timespec="seconds")))
+                self._log(f"[bridge] card updated message_id={self._session_card_message_id} task_id={self._active_task.task_id}")
+            else:
+                self._log(f"[bridge] card updated message_id={self._session_card_message_id}")
+        else:
+            self._log(
+                f"[bridge] card update failed task_id={self._active_task.task_id if self._active_task else '-'} code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+            )
+
+    def _process_codex_chunk(self, text: str, flush_tail: bool = False) -> None:
+        data = self._mobile_line_carry + text
+        lines = data.split("\n")
+        if data.endswith("\n") or flush_tail:
+            self._mobile_line_carry = ""
+        else:
+            self._mobile_line_carry = lines.pop()
+
+        task = self._active_task
+        if not task:
+            return
+
+        changed = False
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            event = self._parse_codex_event_line(line)
+            if not event:
+                if line.startswith("Error:"):
+                    msg = line[6:].strip()
+                    task.events.append(f"error:{msg}")
+                    self.history.update_task(task.task_id, lambda d, m=msg: d["events"].append(f"error:{m}"))
+                    changed = True
+                continue
+
+            kind = event.get("kind")
+            value = event.get("value", "")
+            if kind == "command_started" and value:
+                task.commands.append(value)
+                self._append_status(f"命令执行中：`{value}`")
+                self._log(f"[bridge] task command_started task_id={task.task_id} command={value}")
+                self.history.update_task(
+                    task.task_id,
+                    lambda d, v=value: (d["commands"].append(v), d["events"].append(f"command_started:{v}")),
+                )
+                changed = True
+            elif kind == "agent_message" and value:
+                task.answer_parts.append(value)
+                if self._session_answer_parts == ["_等待回答中..._"]:
+                    self._session_answer_parts = []
+                self._append_answer(value)
+                self._log(f"[bridge] task agent_message task_id={task.task_id} size={len(value)}")
+                self.history.update_task(
+                    task.task_id,
+                    lambda d, v=value: (d["answer_parts"].append(v), d["events"].append("agent_message")),
+                )
+                changed = True
+            elif kind == "completed":
+                task.status = "completed"
+                task.finished_at = datetime.now().isoformat(timespec="seconds")
+                self._append_status("本轮请求执行完成。")
+                self.history.update_task(
+                    task.task_id,
+                    lambda d: (d.__setitem__("status", "completed"), d.__setitem__("finished_at", datetime.now().isoformat(timespec="seconds"))),
+                )
+                changed = True
+
+        if changed:
+            self._update_task_card()
+        if task.status == "completed":
+            self._update_task_card(force=True)
+            self._active_task = None
+
+    def _parse_codex_event_line(self, line: str) -> Optional[dict]:
+        if not (line.startswith("{") and line.endswith("}")):
+            return None
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None
+        event_type = str(obj.get("type") or "")
+        if event_type == "turn.completed":
+            return {"kind": "completed", "value": ""}
+        item = obj.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type") or "")
+        if event_type == "item.started" and item_type == "command_execution":
+            return {"kind": "command_started", "value": str(item.get("command") or "").strip()}
+        if event_type == "item.completed" and item_type == "agent_message":
+            return {"kind": "agent_message", "value": str(item.get("text") or "").strip()}
+        return None
+
+    def _handle_history_command(self, chat_id: str, normalized_text: str) -> None:
+        parts = normalized_text.split()
+        if len(parts) == 1:
+            items = self.history.list_recent(10)
+            if not items:
+                self._send_text(chat_id, "暂无历史记录。")
+                return
+            lines = ["最近历史任务："]
+            for it in items:
+                prompt = it["prompt"][:40] + ("..." if len(it["prompt"]) > 40 else "")
+                lines.append(f"- `{it['task_id']}` [{it['status']}] {prompt}")
+            lines.append("用法：/history <task_id> 查看详情，/history clear 清空")
+            self._send_text(chat_id, "\n".join(lines))
+            return
+        if len(parts) == 2 and parts[1].lower() == "clear":
+            count = self.history.clear()
+            self._send_text(chat_id, f"历史记录已清空，共删除 {count} 条。")
+            return
+        task_id = parts[1]
+        data = self.history.get_task(task_id)
+        if not data:
+            self._send_text(chat_id, f"未找到任务：{task_id}")
+            return
+        commands = data.get("commands", [])
+        answer = "\n\n".join(data.get("answer_parts", [])) or "(空)"
+        body = (
+            f"任务ID: `{task_id}`\n"
+            f"状态: {data.get('status')}\n"
+            f"开始: {data.get('started_at')}\n"
+            f"结束: {data.get('finished_at') or '(进行中)'}\n"
+            f"请求: {data.get('prompt')}\n\n"
+            f"命令数: {len(commands)}\n"
+            f"回答:\n{answer}"
+        )
+        self._send_text(chat_id, body)
+
+    def _extract_text(self, message_type: Optional[str], content: Optional[str]) -> str:
+        if message_type != "text" or not content:
+            return ""
+        try:
+            body = json.loads(content)
+            return str(body.get("text", "")).strip()
+        except Exception:
+            return ""
+
+    def _normalize_incoming_text(self, text: str) -> str:
+        if not text:
+            return ""
+        cleaned = text.replace("\u200b", " ").strip()
+        cleaned = MENTION_TOKEN_RE.sub(" ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _command_allowed(self, command: str) -> bool:
+        if not self.config.allowed_prefixes:
+            return True
+        return command.startswith(self.config.allowed_prefixes)
+
+    def _help_text(self) -> str:
+        return (
+            "可用命令:\n"
+            "/bind - 绑定当前会话为推送目标\n"
+            "/status - 查看 bridge 状态\n"
+            "/cmd <command> - 在本地终端执行命令\n"
+            "/codex - 进入 Codex 对话模式（每条自然语言触发一次 codex exec --json）\n"
+            "/exitcodex - 退出 Codex 对话模式\n"
+            "/history - 查看最近任务；/history <task_id> 查看详情；/history clear 清空历史\n"
+            "/ctrlc - 给终端发送 Ctrl+C\n"
+            "说明: Codex 模式下会持续更新同一张卡片，直到 /exitcodex"
+        )
+
+    def _send_bound_chat(self, text: str) -> None:
+        if not self.state.bound_chat_id:
+            return
+        self._send_text(self.state.bound_chat_id, text)
+
+    def _send_text(self, chat_id: str, text: str) -> None:
+        try:
+            # Try markdown-rendered interactive card first.
+            if self._send_markdown(chat_id, text):
+                return
+
+            # Fallback to post-richtext rendering before plain text.
+            if self._send_post(chat_id, text):
+                return
+
+            # Last fallback to plain text.
+            req = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": text}, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            resp = self.api_client.im.v1.message.create(req)
+            if not resp.success():
+                self._log(
+                    f"[bridge] send failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+                )
+            else:
+                self._log(f"[bridge] send ok(text) chat_id={chat_id} size={len(text)}")
+        except Exception as exc:
+            self._log(f"[bridge] send exception chat_id={chat_id} err={exc}")
+
+    def _send_markdown(self, chat_id: str, text: str) -> bool:
+        msg_id = self._send_template_card(
+            chat_id,
+            raw_text=text,
+            status_text="系统消息",
+            answer_text=text,
+        )
+        return bool(msg_id)
+
+    def _template_card_content(self, raw_text: str, status_text: str = "", answer_text: str = "") -> dict:
+        safe_raw = raw_text if raw_text.strip() else " "
+        safe_status = status_text if status_text.strip() else " "
+        safe_answer = answer_text if answer_text.strip() else " "
+        variables = {}
+        if self.config.card_status_var_name and self.config.card_answer_var_name:
+            variables[self.config.card_status_var_name] = safe_status
+            variables[self.config.card_answer_var_name] = safe_answer
+        else:
+            variables[self.config.card_template_var_name] = safe_raw
+        return {
+            "type": "template",
+            "data": {
+                "template_id": self.config.card_template_id,
+                "template_variable": variables,
+            },
+        }
+
+    def _send_template_card(
+        self,
+        chat_id: str,
+        raw_text: str,
+        status_text: str = "",
+        answer_text: str = "",
+    ) -> str:
+        safe_text = raw_text if raw_text.strip() else " "
+        if not self.config.card_template_id:
+            self._log("[bridge] schema2 template card skipped: CARD_TEMPLATE_ID is empty")
+            return ""
+
+        card = self._template_card_content(raw_text=safe_text, status_text=status_text, answer_text=answer_text)
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.create(req)
+        if resp.success():
+            msg_type = getattr(resp.data, "msg_type", None) if resp.data else None
+            msg_id = getattr(resp.data, "message_id", None) if resp.data else None
+            self._log(
+                f"[bridge] send ok(schema2-template-card) chat_id={chat_id} size={len(safe_text)}"
+                f" msg_type={msg_type} message_id={msg_id}"
+            )
+            return msg_id or ""
+        self._log(
+            f"[bridge] send schema2-template-card failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+        )
+        return ""
+
+    def _send_post(self, chat_id: str, text: str) -> bool:
+        lines = [ln for ln in text.split("\n")]
+        content_blocks = []
+        for ln in lines:
+            ln = ln.rstrip()
+            if not ln:
+                content_blocks.append([{"tag": "text", "text": " "}])
+            else:
+                content_blocks.append([{"tag": "text", "text": ln}])
+
+        post_payload = {
+            "zh_cn": {
+                "title": "OpenCodex",
+                "content": content_blocks,
+            }
+        }
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("post")
+                .content(json.dumps(post_payload, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.api_client.im.v1.message.create(req)
+        if not resp.success():
+            self._log(
+                f"[bridge] send post failed code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+            )
+            return False
+        self._log(f"[bridge] send ok(post) chat_id={chat_id} size={len(text)}")
+        return True
+
+    def _log(self, message: str) -> None:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} {message}"
+        with self._log_lock:
+            print(line)
+            with self._log_file.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+
+def main() -> None:
+    config = Config.load()
+    bridge = FeishuCodexBridge(config)
+
+    def _graceful_stop(_signum, _frame):
+        bridge.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _graceful_stop)
+    signal.signal(signal.SIGTERM, _graceful_stop)
+
+    bridge.start()
+
+
+if __name__ == "__main__":
+    main()
