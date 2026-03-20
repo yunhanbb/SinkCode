@@ -4,6 +4,7 @@ import queue
 import re
 import shlex
 import signal
+import socket
 import ssl
 import subprocess
 import threading
@@ -85,6 +86,7 @@ class Config:
     card_template_var_name: str
     card_status_var_name: str
     card_answer_var_name: str
+    client_name: str
     math_tutor_system_prompt: str
     math_tutor_doc_folder_token: str
     math_tutor_doc_title: str
@@ -139,6 +141,7 @@ class Config:
             card_template_var_name=os.getenv("CARD_TEMPLATE_VAR_NAME", "content").strip() or "content",
             card_status_var_name=os.getenv("CARD_STATUS_VAR_NAME", "status_content").strip(),
             card_answer_var_name=os.getenv("CARD_ANSWER_VAR_NAME", "answer_content").strip(),
+            client_name=os.getenv("OPENCODEX_CLIENT_NAME", "").strip() or socket.gethostname().strip() or "OpenCodex",
             math_tutor_system_prompt=os.getenv("MATH_TUTOR_SYSTEM_PROMPT", "").strip(),
             math_tutor_doc_folder_token=os.getenv("MATH_TUTOR_DOC_FOLDER_TOKEN", "").strip(),
             math_tutor_doc_title=os.getenv("MATH_TUTOR_DOC_TITLE", "OpenCodex 数学辅导总结").strip() or "OpenCodex 数学辅导总结",
@@ -150,6 +153,8 @@ class BridgeState:
         self.state_file = state_file
         self.authorized_open_id: Optional[str] = None
         self.bound_chat_id: Optional[str] = None
+        self.client_id: str = ""
+        self.selected_chat_id: str = ""
         self.math_tutor_system_prompt: str = ""
         self.math_summary_doc_id: str = ""
         self.math_summary_doc_title: str = ""
@@ -163,17 +168,45 @@ class BridgeState:
             raw = json.loads(self.state_file.read_text(encoding="utf-8"))
             self.authorized_open_id = raw.get("authorized_open_id")
             self.bound_chat_id = raw.get("bound_chat_id")
+            self.client_id = str(raw.get("client_id") or "")
+            self.selected_chat_id = str(raw.get("selected_chat_id") or "")
             self.math_tutor_system_prompt = str(raw.get("math_tutor_system_prompt") or "")
             self.math_summary_doc_id = str(raw.get("math_summary_doc_id") or "")
             self.math_summary_doc_title = str(raw.get("math_summary_doc_title") or "")
         except Exception:
             pass
 
+    def ensure_client_identity(self) -> str:
+        with self._lock:
+            if not self.client_id:
+                self.client_id = uuid4().hex[:8]
+                self._save_locked()
+            return self.client_id
+
     def bind(self, open_id: str, chat_id: str) -> None:
         with self._lock:
             self.authorized_open_id = open_id
             self.bound_chat_id = chat_id
+            self.selected_chat_id = ""
             self._save_locked()
+
+    def select_chat(self, chat_id: str) -> None:
+        with self._lock:
+            self.selected_chat_id = chat_id.strip()
+            self._save_locked()
+
+    def clear_selected_chat(self, chat_id: str = "") -> bool:
+        with self._lock:
+            if chat_id and self.selected_chat_id != chat_id:
+                return False
+            if not self.selected_chat_id:
+                return False
+            self.selected_chat_id = ""
+            self._save_locked()
+            return True
+
+    def is_selected_chat(self, chat_id: Optional[str]) -> bool:
+        return bool(chat_id) and chat_id == self.selected_chat_id
 
     def set_math_tutor_system_prompt(self, prompt: str) -> None:
         with self._lock:
@@ -201,6 +234,8 @@ class BridgeState:
         payload = {
             "authorized_open_id": self.authorized_open_id,
             "bound_chat_id": self.bound_chat_id,
+            "client_id": self.client_id,
+            "selected_chat_id": self.selected_chat_id,
             "math_tutor_system_prompt": self.math_tutor_system_prompt,
             "math_summary_doc_id": self.math_summary_doc_id,
             "math_summary_doc_title": self.math_summary_doc_title,
@@ -405,6 +440,8 @@ class FeishuCodexBridge:
         self._log_file.parent.mkdir(parents=True, exist_ok=True)
         self._log(f"[bridge] logfile: {self._log_file}")
         self.state = BridgeState(config.state_file)
+        self.client_id = self.state.ensure_client_identity()
+        self.client_name = config.client_name
         self.history = HistoryStore(config.history_dir)
         self.shell = ShellSession(config.shell_path)
         self.shutdown = threading.Event()
@@ -433,6 +470,12 @@ class FeishuCodexBridge:
 
         self.forwarder_thread = threading.Thread(target=self._forward_terminal_output, daemon=True)
         self.codex_mode = False
+        self._codex_setup_stage = ""
+        self._pending_codex_model = ""
+        self._pending_codex_model_display = ""
+        self._codex_model = ""
+        self._codex_model_display = "default"
+        self._codex_permission = ""
         self.math_tutor_mode = False
         self._mobile_line_carry = ""
         self._active_task: Optional[CodexTask] = None
@@ -463,6 +506,7 @@ class FeishuCodexBridge:
         self._math_status_typing_index = 0
         self._math_answer_typing_index = 0
         self._last_math_doc_error = ""
+        self._log(f"[bridge] client ready: {self._client_label()}")
 
     def _apply_tls_config(self) -> None:
         ssl_context: Optional[ssl.SSLContext] = None
@@ -530,6 +574,195 @@ class FeishuCodexBridge:
         self._interrupt_math_tutor()
         self.shell.stop()
 
+    def _client_label(self) -> str:
+        return f"{self.client_name} ({self.client_id})"
+
+    def _is_selected_chat(self, chat_id: str) -> bool:
+        return self.state.is_selected_chat(chat_id)
+
+    def _selected_required(self, chat_id: str, normalized_text: str, message_type: str) -> bool:
+        if self._is_selected_chat(chat_id):
+            return True
+        self._log(
+            "[bridge] ignored unselected message: "
+            f"chat_id={chat_id} client={self._client_label()} type={message_type} text={normalized_text!r}"
+        )
+        return False
+
+    def _current_mode_label(self) -> str:
+        if self._codex_setup_stage:
+            return "codex-setup"
+        if self.math_tutor_mode:
+            return "math"
+        if self.codex_mode:
+            return "codex"
+        return "shell"
+
+    @staticmethod
+    def _normalize_codex_model(raw: str) -> tuple[str, str]:
+        value = raw.strip()
+        if not value:
+            return "", ""
+        if value.lower() in {"default", "默认", "local-default"}:
+            return "", "default"
+        return value, value
+
+    @staticmethod
+    def _normalize_codex_permission(raw: str) -> str:
+        value = raw.strip().lower()
+        aliases = {
+            "read-only": "read-only",
+            "readonly": "read-only",
+            "read_only": "read-only",
+            "workspace-write": "workspace-write",
+            "workspace_write": "workspace-write",
+            "workspace": "workspace-write",
+            "danger-full-access": "danger-full-access",
+            "danger_full_access": "danger-full-access",
+            "danger": "danger-full-access",
+            "full-access": "danger-full-access",
+        }
+        return aliases.get(value, "")
+
+    @staticmethod
+    def _codex_permission_prompt() -> str:
+        return "请输入 permission：`read-only` / `workspace-write` / `danger-full-access`"
+
+    def _reset_codex_setup_state(self) -> None:
+        self._codex_setup_stage = ""
+        self._pending_codex_model = ""
+        self._pending_codex_model_display = ""
+
+    def _reset_codex_session_options(self) -> None:
+        self._codex_model = ""
+        self._codex_model_display = "default"
+        self._codex_permission = ""
+
+    def _begin_codex_setup(self) -> None:
+        self.codex_mode = False
+        self._reset_codex_card_state()
+        self._reset_codex_session_options()
+        self._reset_codex_setup_state()
+        self._codex_setup_stage = "model"
+
+    def _finish_codex_setup(self) -> None:
+        self._reset_codex_setup_state()
+        self.codex_mode = True
+        self._reset_codex_card_state()
+
+    def _codex_session_summary(self) -> str:
+        permission = self._codex_permission or "(未设置)"
+        return f"model: `{self._codex_model_display}`\npermission: `{permission}`"
+
+    def _build_codex_exec_command(self, prompt: str) -> str:
+        command = ["codex", "exec", "--json", "--color", "never", "--skip-git-repo-check"]
+        if self._codex_model:
+            command.extend(["--model", self._codex_model])
+        if self._codex_permission:
+            command.extend(["-s", self._codex_permission])
+        command.append(prompt)
+        return " ".join(shlex.quote(part) for part in command)
+
+    def _handle_pending_codex_setup(self, chat_id: str, message_type: str, normalized_text: str) -> bool:
+        if not self._codex_setup_stage:
+            return False
+        if message_type == "image":
+            self._send_text(chat_id, "当前正在进入 Codex。请先用文字回复 model 或 permission；发送 /exitcodex 可取消。")
+            return True
+        if normalized_text.startswith("/"):
+            self._send_text(chat_id, "当前正在进入 Codex。请先完成 model / permission 设置；发送 /exitcodex 可取消。")
+            return True
+        if self._codex_setup_stage == "model":
+            model_arg, model_display = self._normalize_codex_model(normalized_text)
+            if not model_display:
+                self._send_text(chat_id, "model 不能为空。请回复具体模型名，或回复 `default` 使用本地默认模型。")
+                return True
+            self._pending_codex_model = model_arg
+            self._pending_codex_model_display = model_display
+            self._codex_setup_stage = "permission"
+            self._send_text(
+                chat_id,
+                f"已记录 model：`{model_display}`\n{self._codex_permission_prompt()}",
+            )
+            return True
+        permission = self._normalize_codex_permission(normalized_text)
+        if not permission:
+            self._send_text(chat_id, f"permission 无效。\n{self._codex_permission_prompt()}")
+            return True
+        self._codex_model = self._pending_codex_model
+        self._codex_model_display = self._pending_codex_model_display or "default"
+        self._codex_permission = permission
+        self._finish_codex_setup()
+        self._send_text(
+            chat_id,
+            "已进入 Codex 对话模式。\n"
+            f"{self._codex_session_summary()}\n"
+            "后续每条自然语言消息会使用各自的任务卡片。",
+        )
+        return True
+
+    def _client_status_text(self, chat_id: str) -> str:
+        active_task = self._active_task.task_id if self._active_task else "(无)"
+        math_problem_id = self._math_problem.problem_id if self._math_problem else "(无)"
+        selected_here = "是" if self._is_selected_chat(chat_id) else "否"
+        selected_chat = self.state.selected_chat_id or "(未选择)"
+        bound_chat = self.state.bound_chat_id or "(未绑定)"
+        codex_setup = self._codex_setup_stage or "(无)"
+        codex_permission = self._codex_permission or "(未设置)"
+        return (
+            f"客户端: {self.client_name}\n"
+            f"client_id: `{self.client_id}`\n"
+            f"当前会话已选中: {selected_here}\n"
+            f"已选择 chat_id: {selected_chat}\n"
+            f"绑定 chat_id: {bound_chat}\n"
+            f"模式: {self._current_mode_label()}\n"
+            f"codex_setup: {codex_setup}\n"
+            f"codex_model: `{self._codex_model_display}`\n"
+            f"codex_permission: `{codex_permission}`\n"
+            f"codex_mode: {self.codex_mode}\n"
+            f"math_tutor_mode: {self.math_tutor_mode}\n"
+            f"active_task: {active_task}\n"
+            f"math_problem: {math_problem_id}\n"
+            f"选择命令: `/use {self.client_id}`"
+        )
+
+    def _release_chat_selection(self, chat_id: str, reason: str) -> bool:
+        if not self._is_selected_chat(chat_id):
+            return False
+
+        codex_task = self._active_task
+        if codex_task:
+            codex_task.status = "interrupted"
+            codex_task.finished_at = datetime.now().isoformat(timespec="seconds")
+            self._append_status(reason)
+            self.history.update_task(
+                codex_task.task_id,
+                lambda d: (d.__setitem__("status", "interrupted"), d.__setitem__("finished_at", datetime.now().isoformat(timespec="seconds"))),
+            )
+            self._flush_typewriter()
+            self._update_task_card(force=True)
+
+        math_problem = self._math_problem
+        math_interrupted = self._interrupt_math_tutor()
+        if math_problem and math_problem.card_message_id:
+            self._append_math_status(reason)
+            if math_interrupted:
+                self._append_math_status("本机已停止当前讲解。")
+            self._flush_math_typewriter()
+            self._update_math_card(force=True)
+
+        self.shell.send_ctrl_c()
+        self.state.clear_selected_chat(chat_id)
+        self.codex_mode = False
+        self._reset_codex_setup_state()
+        self._reset_codex_session_options()
+        self.math_tutor_mode = False
+        self._mobile_line_carry = ""
+        self._active_task = None
+        self._reset_codex_card_state()
+        self._finalize_math_problem(sync_doc=not math_interrupted)
+        return True
+
     def _on_receive_message(self, data: P2ImMessageReceiveV1) -> None:
         event = data.event
         if not event or not event.message or not event.sender:
@@ -564,7 +797,13 @@ class FeishuCodexBridge:
             if not sender_open_id or not chat_id:
                 return
             self.state.bind(sender_open_id, chat_id)
-            self._send_text(chat_id, "绑定成功。后续终端输出会推送到此会话。")
+            self._send_text(
+                chat_id,
+                (
+                    f"绑定成功。\n客户端: {self.client_name}\nclient_id: `{self.client_id}`\n"
+                    "说明: 多客户端场景下，请先发送 `/clients` 查看在线客户端，再发送 `/use <client_id>` 选择当前处理客户端。"
+                ),
+            )
             return
 
         if not self.state.is_authorized(sender_open_id):
@@ -575,8 +814,45 @@ class FeishuCodexBridge:
             self._send_text(chat_id, self._help_text())
             return
 
+        if normalized_text.startswith("/clients"):
+            self._send_text(chat_id, self._client_status_text(chat_id))
+            return
+
+        if normalized_text.startswith("/use"):
+            if not self.state.bound_chat_id:
+                self._send_text(chat_id, "当前还没有绑定会话。请先发送 /bind。")
+                return
+            if self.state.bound_chat_id != chat_id:
+                self._send_text(chat_id, "当前会话还不是绑定会话。请先在这个会话里重新发送 /bind。")
+                return
+            parts = normalized_text.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                self._send_text(chat_id, "用法: /use <client_id>")
+                return
+            target_client_id = parts[1].strip()
+            if self.client_id == target_client_id:
+                already_selected = self._is_selected_chat(chat_id)
+                self.state.select_chat(chat_id)
+                if already_selected:
+                    self._send_text(chat_id, f"当前会话已由客户端 {self._client_label()} 处理。")
+                else:
+                    self._send_text(chat_id, f"已选择客户端 {self._client_label()}。后续普通命令将由本机处理。")
+                return
+            if self._release_chat_selection(chat_id, "当前会话已切换到其他客户端，本机停止处理。"):
+                self._send_text(chat_id, f"客户端 {self._client_label()} 已释放当前会话。")
+            return
+
+        if normalized_text.startswith("/leaveclient") or normalized_text.startswith("/unuse"):
+            if self._release_chat_selection(chat_id, "当前会话已取消客户端选择，本机停止处理。"):
+                self._send_text(chat_id, f"客户端 {self._client_label()} 已退出当前会话。")
+            return
+
         if normalized_text.startswith("/status"):
             bound = self.state.bound_chat_id or "(未绑定)"
+            selected_chat = self.state.selected_chat_id or "(未选择)"
+            selected_here = "是" if self._is_selected_chat(chat_id) else "否"
+            codex_setup = self._codex_setup_stage or "(无)"
+            codex_permission = self._codex_permission or "(未设置)"
             active_task = self._active_task.task_id if self._active_task else "(无)"
             card_id = self._session_card_message_id or "(无)"
             general_card_id = self._general_card_message_id or "(无)"
@@ -584,12 +860,22 @@ class FeishuCodexBridge:
             math_card_id = self._math_problem.card_message_id if self._math_problem else "(无)"
             self._send_text(
                 chat_id,
-                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nmath_tutor_mode: {self.math_tutor_mode}\nactive_task: {active_task}\nmath_problem: {math_problem_id}\ngeneral_card: {general_card_id}\ncodex_card: {card_id}\nmath_card: {math_card_id}",
+                (
+                    f"bridge 运行中\n客户端: {self.client_name}\nclient_id: `{self.client_id}`\n当前会话已选中: {selected_here}\n"
+                    f"已选择 chat_id: {selected_chat}\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\n"
+                    f"codex_setup: {codex_setup}\ncodex_model: `{self._codex_model_display}`\ncodex_permission: `{codex_permission}`\n"
+                    f"codex_mode: {self.codex_mode}\nmath_tutor_mode: {self.math_tutor_mode}\nactive_task: {active_task}\n"
+                    f"math_problem: {math_problem_id}\ngeneral_card: {general_card_id}\ncodex_card: {card_id}\nmath_card: {math_card_id}"
+                ),
             )
             return
 
         if normalized_text.startswith("/ps"):
             bound = self.state.bound_chat_id or "(未绑定)"
+            selected_chat = self.state.selected_chat_id or "(未选择)"
+            selected_here = "是" if self._is_selected_chat(chat_id) else "否"
+            codex_setup = self._codex_setup_stage or "(无)"
+            codex_permission = self._codex_permission or "(未设置)"
             active_task = self._active_task.task_id if self._active_task else "(无)"
             card_id = self._session_card_message_id or "(无)"
             general_card_id = self._general_card_message_id or "(无)"
@@ -597,8 +883,20 @@ class FeishuCodexBridge:
             math_card_id = self._math_problem.card_message_id if self._math_problem else "(无)"
             self._send_text(
                 chat_id,
-                f"bridge 运行中\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\ncodex_mode: {self.codex_mode}\nmath_tutor_mode: {self.math_tutor_mode}\nactive_task: {active_task}\nmath_problem: {math_problem_id}\ngeneral_card: {general_card_id}\ncodex_card: {card_id}\nmath_card: {math_card_id}",
+                (
+                    f"bridge 运行中\n客户端: {self.client_name}\nclient_id: `{self.client_id}`\n当前会话已选中: {selected_here}\n"
+                    f"已选择 chat_id: {selected_chat}\n绑定 chat_id: {bound}\nshell: {self.config.shell_path}\n"
+                    f"codex_setup: {codex_setup}\ncodex_model: `{self._codex_model_display}`\ncodex_permission: `{codex_permission}`\n"
+                    f"codex_mode: {self.codex_mode}\nmath_tutor_mode: {self.math_tutor_mode}\nactive_task: {active_task}\n"
+                    f"math_problem: {math_problem_id}\ngeneral_card: {general_card_id}\ncodex_card: {card_id}\nmath_card: {math_card_id}"
+                ),
             )
+            return
+
+        if self._handle_pending_codex_setup(chat_id, message_type, normalized_text):
+            return
+
+        if not self._selected_required(chat_id, normalized_text, message_type):
             return
 
         if normalized_text.startswith("/history"):
@@ -690,7 +988,7 @@ class FeishuCodexBridge:
             return
 
         if normalized_text == "教我做题":
-            if self.codex_mode:
+            if self.codex_mode or self._codex_setup_stage:
                 self._send_text(chat_id, "当前在 Codex 对话模式。请先发送 /exitcodex，再进入数学辅导。")
                 return
             if self.math_tutor_mode:
@@ -730,15 +1028,24 @@ class FeishuCodexBridge:
             if self.math_tutor_mode:
                 self._send_text(chat_id, "当前在数学辅导模式。请先发送“退出做题”，再进入 Codex 对话模式。")
                 return
+            if self._codex_setup_stage:
+                if self._codex_setup_stage == "model":
+                    self._send_text(chat_id, "正在等待你回复 model。回复 `default` 使用本地默认模型，或发送 /exitcodex 取消。")
+                else:
+                    self._send_text(chat_id, f"已记录 model：`{self._pending_codex_model_display or 'default'}`\n{self._codex_permission_prompt()}")
+                return
             if self.codex_mode:
                 if self._active_task and self._active_task.status == "running":
                     self._send_text(chat_id, "已在 Codex 对话模式，当前任务仍在执行。")
                 else:
-                    self._send_text(chat_id, "已在 Codex 对话模式。直接发送自然语言消息即可创建新的任务卡片。")
+                    self._send_text(chat_id, "已在 Codex 对话模式。\n" f"{self._codex_session_summary()}\n直接发送自然语言消息即可创建新的任务卡片。")
                 return
-            self.codex_mode = True
-            self._reset_codex_card_state()
-            self._send_text(chat_id, "已进入 Codex 对话模式。后续每条自然语言消息会使用各自的任务卡片。", force_new=True)
+            self._begin_codex_setup()
+            self._send_text(
+                chat_id,
+                "即将进入 Codex 对话模式。\n请先回复 model；如使用本地默认模型，请回复 `default`。",
+                force_new=True,
+            )
             return
 
         if normalized_text.startswith("/exitcodex"):
@@ -751,12 +1058,18 @@ class FeishuCodexBridge:
                 )
                 self._flush_typewriter()
                 self._update_task_card(force=True)
+            was_pending = bool(self._codex_setup_stage) and not self.codex_mode
             self.codex_mode = False
+            self._reset_codex_setup_state()
+            self._reset_codex_session_options()
             self._mobile_line_carry = ""
             self._active_task = None
             self._reset_codex_card_state()
             self.shell.send_ctrl_c()
-            self._send_text(chat_id, "已退出 Codex 终端模式。", force_new=True)
+            if was_pending:
+                self._send_text(chat_id, "已取消进入 Codex 对话模式。", force_new=True)
+            else:
+                self._send_text(chat_id, "已退出 Codex 终端模式。", force_new=True)
             return
 
         if normalized_text.startswith("/cmd"):
@@ -792,17 +1105,16 @@ class FeishuCodexBridge:
             self._session_answer_parts = ["_等待回答中..._"]
             task = self._create_task(chat_id, sender_open_id or "", normalized_text)
             self._active_task = task
+            self._append_status(f"会话配置：model=`{self._codex_model_display}` permission=`{self._codex_permission}`")
             self._append_status(f"新请求：{normalized_text}")
             self._append_status("请求已接收，正在执行。")
             self._session_card_message_id = self._send_session_card(chat_id)
             task.card_message_id = self._session_card_message_id
             self.history.update_task(task.task_id, lambda d, cid=self._session_card_message_id: d.__setitem__("card_message_id", cid))
             self._update_task_card(force=True)
-            prompt = shlex.quote(normalized_text)
-            self._log(f"[bridge] exec -> shell: codex exec --json --color never --skip-git-repo-check {prompt}")
-            self.shell.send_command(
-                f"codex exec --json --color never --skip-git-repo-check {prompt}"
-            )
+            command = self._build_codex_exec_command(normalized_text)
+            self._log(f"[bridge] exec -> shell: {command}")
+            self.shell.send_command(command)
             return
 
         if normalized_text.startswith("/"):
@@ -1421,6 +1733,8 @@ class FeishuCodexBridge:
     def _update_task_card(self, force: bool = False) -> None:
         if not self._session_card_message_id:
             return
+        if self._active_task and not self._is_selected_chat(self._active_task.chat_id):
+            return
         progressed = self._advance_typewriter()
         now = time.monotonic()
         if self._active_task and not force and (now - self._active_task.last_card_push_ts) < self.config.card_update_interval_seconds:
@@ -1754,6 +2068,8 @@ class FeishuCodexBridge:
     def _update_math_card(self, force: bool = False) -> None:
         problem = self._math_problem
         if not problem or not problem.card_message_id:
+            return
+        if not self._is_selected_chat(problem.chat_id):
             return
         progressed = self._advance_math_typewriter()
         now = time.monotonic()
@@ -2423,11 +2739,14 @@ class FeishuCodexBridge:
     def _help_text(self) -> str:
         return (
             "可用命令:\n"
-            "/bind - 绑定当前会话为推送目标\n"
-            "/status - 查看 bridge 状态\n"
+            "/bind - 绑定当前会话，并重置当前客户端选择\n"
+            "/clients - 查看当前这台机器对应的客户端信息；多台机器同时在线时可用来枚举客户端\n"
+            "/use <client_id> - 选择某个客户端处理当前会话\n"
+            "/leaveclient - 释放当前会话上的客户端选择\n"
+            "/status - 查看当前客户端状态\n"
             "/cmd <command> - 在本地终端执行命令\n"
-            "/codex - 进入 Codex 对话模式（每条自然语言触发一次 codex exec --json，并使用独立任务卡片）\n"
-            "/exitcodex - 退出 Codex 对话模式\n"
+            "/codex - 先询问 model 和 permission，再进入 Codex 对话模式\n"
+            "/exitcodex - 退出或取消进入 Codex 对话模式\n"
             "教我做题 - 进入数学辅导模式（支持文字题和图片题）\n"
             "下一题 - 在数学辅导模式下开启新题，下一题使用新卡片\n"
             "结束做题 - 退出数学辅导模式\n"
@@ -2437,11 +2756,14 @@ class FeishuCodexBridge:
             "查看数学总结文档 / 关闭数学总结文档 - 查看或关闭文档同步\n"
             "/history - 查看最近任务；/history <task_id> 查看详情；/history clear 清空历史\n"
             "/ctrlc - 给终端发送 Ctrl+C\n"
-            "说明: 普通模式复用同一张系统卡片；Codex 模式按请求分卡；数学辅导模式按“题目”分卡，同题追问继续写入同一卡片"
+            "说明: 普通模式复用同一张系统卡片；Codex 模式按请求分卡；数学辅导模式按“题目”分卡，同题追问继续写入同一卡片；"
+            "多客户端并行时，先 /clients 再 /use <client_id>，只有被选中的客户端会继续处理普通命令"
         )
 
     def _send_bound_chat(self, text: str) -> None:
         if not self.state.bound_chat_id:
+            return
+        if not self._is_selected_chat(self.state.bound_chat_id):
             return
         self._send_text(self.state.bound_chat_id, text)
 
@@ -2506,7 +2828,7 @@ class FeishuCodexBridge:
         status_lines = [f"系统消息面板", f"当前模式: {mode_text}"]
         if dropped > 0:
             status_lines.append(f"_已折叠更早消息 {dropped} 条_")
-        answer = "\n\n<hr>\n\n".join(self._escape_card_literal(item.strip()) for item in items if item.strip()).strip()
+        answer = "\n\n<hr>\n\n".join(item.strip() for item in items if item.strip()).strip()
         if not answer:
             answer = "_暂无消息_"
         return "\n".join(status_lines), answer
